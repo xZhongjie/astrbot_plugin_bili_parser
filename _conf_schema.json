@@ -73,6 +73,12 @@
     "default": false,
     "hint": "开启后跳过直连 CDN、镜像、durl 等尝试，直接把视频地址交给 video_proxy_api 代理下载；代理失败会自动回退直连。"
   },
+  "attach_video_links": {
+    "description": "只返回解析后的视频直链",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后不下载、不发送视频，而是在卡片后面附上解析出的视频直链（MP4 / DASH，B站签名约 2 小时有效）。开启时会忽略「下载并发送视频」。"
+  },
   "video_proxy_apis": {
     "description": "视频下载代理接口列表",
     "type": "template_list",

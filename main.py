@@ -1614,6 +1614,36 @@ class BiliParserPlugin(Star):
         logger.warning("[bili] 所有视频地址都下载失败（可能被 B 站 CDN 拦截）")
         return None
 
+    async def _collect_video_links(
+        self, video: BiliVideo, target: BiliTarget
+    ) -> list[tuple[str, str]]:
+        """解析出可用于外部下载的视频直链（不下载视频本身）。"""
+        if self.http is None:
+            return []
+        self._ensure_cid(video)
+        qn = int(self.config.get("video_quality") or 64)
+        links: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        def add(label: str, url: str) -> None:
+            if not url or not url.startswith(("http://", "https://")):
+                return
+            if url in seen:
+                return
+            seen.add(url)
+            links.append((label, url))
+
+        if video.video_url:
+            add("原始直链", video.video_url)
+        try:
+            durl = await self._request_play_url(video, qn, 1)
+            add(f"{qn}P MP4", durl)
+            dash = await self._request_play_url(video, qn, 16)
+            add(f"{qn}P DASH", dash)
+        except Exception as exc:
+            logger.info("[bili] 获取视频直链失败：%s", self._brief(exc))
+        return links[:3]
+
     async def build_chain(
         self, video: BiliVideo, target: BiliTarget, *, allow_video: bool = True
     ) -> tuple[list[Any], str | None]:
@@ -1627,8 +1657,17 @@ class BiliParserPlugin(Star):
         if text:
             chain.append(Comp.Plain(text))
 
+        # 只输出解析直链模式
+        if bool(self.config.get("attach_video_links")):
+            links = await self._collect_video_links(video, target)
+            if links:
+                body = "\n".join(f"{label}：{url}" for label, url in links)
+                chain.append(
+                    Comp.Plain(f"视频直链（B站签名，约 2 小时有效）：\n{body}")
+                )
+
         temp_path: str | None = None
-        if allow_video and self.config.get("send_video"):
+        if allow_video:
             temp_path = await self._download_video(video, target)
             if temp_path:
                 # 不能在这里立刻删除：AstrBot 的 respond 阶段是在插件处理器
@@ -1860,14 +1899,19 @@ class BiliParserPlugin(Star):
             except Exception:
                 logger.exception("[bili] 解析异常")
                 continue
-            chain, temp = await self.build_chain(video, target)
+            attach_links = bool(self.config.get("attach_video_links"))
+            chain, temp = await self.build_chain(
+                video,
+                target,
+                allow_video=bool(self.config.get("send_video")) and not attach_links,
+            )
             if not await self._send_chain(event, chain):
                 # 图片发送失败时降级为纯文本卡片，至少把信息发出去
                 await self._send_plain(event, self.render_card(video, target))
             if temp:
                 # QQ 要求 video 段单独成条，不能和卡片混发
                 await self._send_video(event, temp, video, target)
-            elif self.config.get("send_video"):
+            elif self.config.get("send_video") and not attach_links:
                 await self._send_plain(
                     event,
                     "视频下载失败：B 站 CDN 返回的不是有效视频（可能被拦截），"
@@ -1901,12 +1945,17 @@ class BiliParserPlugin(Star):
             except AllProvidersFailed as exc:
                 await self._send_plain(event, f"B站解析失败：{self._brief(exc)}")
                 continue
-            chain, temp = await self.build_chain(video, target)
+            attach_links = bool(self.config.get("attach_video_links"))
+            chain, temp = await self.build_chain(
+                video,
+                target,
+                allow_video=bool(self.config.get("send_video")) and not attach_links,
+            )
             if not await self._send_chain(event, chain):
                 await self._send_plain(event, self.render_card(video, target))
             if temp:
                 await self._send_video(event, temp, video, target)
-            elif self.config.get("send_video"):
+            elif self.config.get("send_video") and not attach_links:
                 await self._send_plain(
                     event,
                     "视频下载失败：B 站 CDN 返回的不是有效视频（可能被拦截），"

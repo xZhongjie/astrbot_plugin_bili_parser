@@ -84,6 +84,8 @@ git clone https://github.com/xZhongjie/astrbot_plugin_bili_parser.git
 | `send_cover` | `true` | 发送封面图 |
 | `send_video` | `false` | 下载并发送视频 |
 | `max_video_mb` | `30` | 视频大小上限，`0` 不限 |
+| `video_send_mode` | `auto` | 视频发送方式：`auto` / `base64` / `file` |
+| `video_base64_max_mb` | `20` | 不超过该大小时用 base64 发送，避免协议端找不到本地文件 |
 | `video_quality` | `64` | 视频清晰度：`32`/`64`/`80` |
 | `template` | 见默认 | 卡片文本模板 |
 | `desc_max_chars` | `80` | 简介截断长度，`0` 不限 |
@@ -176,7 +178,12 @@ https://your-parse-api.example.com/bili?url={url}
 - 官方接口只能给信息，视频直链要下载时再调 `playurl`，未登录时清晰度可能被限制
 - 第三方免费接口随时可能失效，插件会在日志里打印每个接口的失败原因
 - 视频下载会占用内存与磁盘，默认关闭；大群建议保持关闭
-- **视频会作为单独一条消息发送**：QQ / OneBot 要求 `video` 段不能与文字、图片混在同一条消息里（否则报 `retcode 1400: message element "video" must be the only segment`）。如果 AstrBot 与 QQ 协议端不在同一文件系统，请配置 AstrBot 的 `callback_api_base`，插件会把本地视频转成 HTTP 链接再发送；否则请保持 `send_video` 关闭
+- **视频会作为单独一条消息发送**：QQ / OneBot 要求 `video` 段不能与文字、图片混在同一条消息里（否则报 `retcode 1400: message element "video" must be the only segment`）
+- **视频发送方式**（`video_send_mode`）：
+  - `auto`（默认）：配置了 AstrBot 的 `callback_api_base` 时用本地路径（AstrBot 自动转 HTTP 链接）；没配置时，不超过 `video_base64_max_mb` 的视频转成 `base64://` 发送，完全绕开协议端的文件系统
+  - `base64`：强制 base64，适合协议端在另一个容器 / 机器
+  - `file`：强制本地路径，适合 AstrBot 与协议端共享文件系统
+- 视频文件会在发送后延迟 10 分钟清理，启动时也会清理一天前的缓存，不会一直占磁盘
 - 解析失败时默认静默（`show_error` 可打开），日志里仍有详细记录
 
 ---

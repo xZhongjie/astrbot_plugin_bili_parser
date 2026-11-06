@@ -568,6 +568,7 @@ class BiliParserPlugin(Star):
         )
         self.providers = self._load_providers()
         self._rotate_buvid()
+        await self._prune_media_cache()
         enabled = [p["name"] for p in self.providers if p["enabled"]]
         self._initialized = True
         logger.info(
@@ -581,6 +582,21 @@ class BiliParserPlugin(Star):
             await self.http.close()
             self.http = None
         self._initialized = False
+
+    async def _prune_media_cache(self) -> None:
+        """清理一天前的临时视频，避免磁盘越用越多。"""
+        if self._data_dir is None:
+            return
+        cutoff = time.time() - 86400
+        try:
+            for path in self._data_dir.glob("bili_*.mp4"):
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink()
+                except OSError:
+                    continue
+        except Exception:
+            pass
 
     # -- 官方 cookie --------------------------------------------------------
     def _rotate_buvid(self) -> None:
@@ -868,8 +884,39 @@ class BiliParserPlugin(Star):
             video.cover, headers=BILI_HEADERS, timeout=20
         )
         if data:
-            return Comp.Image.fromBase64(base64.b64encode(data).decode())
+            # B站封面经常是 WebP / AVIF / 带透明通道，部分 QQ 客户端会解码不全
+            # （表现为下半截灰色），统一转成 JPEG 再发。
+            normalized = await asyncio.to_thread(self._normalize_cover, data)
+            payload = normalized or data
+            return Comp.Image.fromBase64(base64.b64encode(payload).decode())
         return Comp.Image.fromURL(video.cover)
+
+    @staticmethod
+    def _normalize_cover(data: bytes) -> bytes | None:
+        try:
+            import io
+
+            from PIL import Image as PILImage
+
+            with PILImage.open(io.BytesIO(data)) as image:
+                image = image.convert("RGB")
+                max_width, max_height = 1280, 4000
+                if image.width > max_width or image.height > max_height:
+                    scale = min(
+                        max_width / image.width, max_height / image.height
+                    )
+                    size = (
+                        max(1, int(image.width * scale)),
+                        max(1, int(image.height * scale)),
+                    )
+                    resample = getattr(PILImage, "Resampling", PILImage).LANCZOS
+                    image = image.resize(size, resample)
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=88, optimize=True)
+                return buffer.getvalue()
+        except Exception as exc:
+            logger.debug("[bili] 封面转码失败，回退原图：%s", exc)
+            return None
 
     @staticmethod
     def _candidate_video_urls(url: str):
@@ -980,21 +1027,79 @@ class BiliParserPlugin(Star):
         temp_path: str | None = None
         if allow_video and self.config.get("send_video"):
             temp_path = await self._download_video(video)
+            if temp_path:
+                # 不能在这里立刻删除：AstrBot 的 respond 阶段是在插件处理器
+                # 结束后才真正发送，提前删文件会导致协议端 ENOENT。
+                self._schedule_cleanup(temp_path, delay=600)
         return chain, temp_path
 
-    @staticmethod
-    def _video_chain(temp_path: str) -> list[Any]:
+    # -- 视频发送方式 -------------------------------------------------------
+    def _callback_api_configured(self) -> bool:
+        try:
+            config = self.context.get_config()
+            return bool(str(config.get("callback_api_base") or "").strip())
+        except Exception:
+            return False
+
+    async def _video_chain(self, temp_path: str) -> list[Any]:
         """视频必须单独成条发送。
 
         OneBot / QQ（NapCat 等）要求 message 里 video 段不能和其它段混发，
         否则会返回 retcode 1400：message element "video" must be the only segment。
-        因此这里返回只含一个 Video 组件的消息链。
 
-        使用普通绝对路径而不是 file:// URI，方便 AstrBot 在配置了
-        callback_api_base 时自动转成可访问的 HTTP 链接，也避免部分协议端
-        不识别 file:// 前缀。
+        发送方式：
+        * 配置了 AstrBot 的 callback_api_base 时用本地路径——AstrBot 会自动
+          把文件注册成 HTTP 链接，适合协议端在另一个容器 / 机器的情况；
+        * 否则把视频转成 base64:// 发送（小文件），不依赖协议端能否访问
+          本机文件系统；
+        * 超过 base64 上限时退回本地路径，并在日志里提示。
         """
+        mode = str(self.config.get("video_send_mode") or "auto").strip().lower()
+        try:
+            size = Path(temp_path).stat().st_size
+        except OSError:
+            size = 0
+        max_b64_mb = int(self.config.get("video_base64_max_mb") or 20)
+        max_b64 = max_b64_mb * 1024 * 1024
+
+        use_base64 = False
+        if mode == "base64":
+            use_base64 = True
+        elif mode == "auto":
+            if self._callback_api_configured():
+                use_base64 = False
+            elif size <= max_b64:
+                use_base64 = True
+
+        if use_base64:
+            data = await asyncio.to_thread(Path(temp_path).read_bytes)
+            logger.info(
+                "[bili] 视频以 base64 发送（%.1fMB）", len(data) / 1024 / 1024
+            )
+            return [Comp.Video(file="base64://" + base64.b64encode(data).decode())]
+
+        if size > max_b64 and mode == "auto":
+            logger.warning(
+                "[bili] 视频 %.1fMB 超过 base64 上限且未配置 callback_api_base，"
+                "改为本地路径发送；若协议端与 AstrBot 不共享文件系统会失败，"
+                "请配置 callback_api_base 或调大 video_base64_max_mb",
+                size / 1024 / 1024,
+            )
         return [Comp.Video(file=temp_path, path=temp_path)]
+
+    def _schedule_cleanup(self, path: str, delay: float = 600) -> None:
+        """延迟删除临时文件，给协议端留出读取时间。"""
+
+        def _remove() -> None:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        try:
+            asyncio.get_running_loop().call_later(delay, _remove)
+        except RuntimeError:
+            _remove()
 
 
     # -- 事件 ---------------------------------------------------------------
@@ -1081,14 +1186,10 @@ class BiliParserPlugin(Star):
                 logger.exception("[bili] 解析异常")
                 continue
             chain, temp = await self.build_chain(video, target)
-            try:
-                yield event.chain_result(chain)
-                if temp:
-                    # QQ 要求 video 段单独成条，不能和卡片混发
-                    yield event.chain_result(self._video_chain(temp))
-            finally:
-                if temp:
-                    Path(temp).unlink(missing_ok=True)
+            yield event.chain_result(chain)
+            if temp:
+                # QQ 要求 video 段单独成条，不能和卡片混发
+                yield event.chain_result(await self._video_chain(temp))
 
     @filter.command("bili", alias={"b站解析", "哔哩哔哩解析"})
     async def bili(self, event: AstrMessageEvent, args: GreedyStr):
@@ -1117,13 +1218,9 @@ class BiliParserPlugin(Star):
                 yield event.plain_result(f"B站解析失败：{self._brief(exc)}")
                 continue
             chain, temp = await self.build_chain(video, target)
-            try:
-                yield event.chain_result(chain)
-                if temp:
-                    yield event.chain_result(self._video_chain(temp))
-            finally:
-                if temp:
-                    Path(temp).unlink(missing_ok=True)
+            yield event.chain_result(chain)
+            if temp:
+                yield event.chain_result(await self._video_chain(temp))
 
     @filter.command("bili_status")
     async def bili_status(self, event: AstrMessageEvent):

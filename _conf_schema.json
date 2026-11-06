@@ -74,6 +74,21 @@
     "slider": {"min": 0, "max": 200, "step": 5},
     "hint": "0 表示不限制。"
   },
+  "video_base64_max_mb": {
+    "description": "Base64 发送上限（MB）",
+    "type": "int",
+    "default": 20,
+    "slider": {"min": 1, "max": 100, "step": 1},
+    "hint": "视频不超过这个大小且未配置 callback_api_base 时，会转成 base64 发送，避免协议端找不到文件。"
+  },
+  "video_send_mode": {
+    "description": "视频发送方式",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "base64", "file"],
+    "labels": ["自动（推荐）", "Base64", "本地路径"],
+    "hint": "自动：配置了 callback_api_base 就用本地路径（AstrBot 会转成 HTTP 链接）；否则小视频用 base64，大视频用本地路径。"
+  },
   "video_quality": {
     "description": "视频清晰度",
     "type": "string",

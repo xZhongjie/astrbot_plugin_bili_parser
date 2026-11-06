@@ -81,6 +81,9 @@ git clone https://github.com/xZhongjie/astrbot_plugin_bili_parser.git
 | `timeout` | `12` | 单接口超时（秒） |
 | `cookie` | 空 | 可选，填 `SESSDATA=...` 提高官方接口成功率 |
 | `proxy` | 空 | 所有请求走代理，例如 `http://127.0.0.1:7890` |
+| `force_ipv4` | `true` | 强制 IPv4，避免 IPv6 出网导致大文件被截断 |
+| `cover_proxy` | weserv 图片代理 | 封面直连失败时，用第三方图片代理抓取并缩放；留空关闭 |
+| `video_proxy` | 空 | 视频下载代理模板，例如 `https://proxy.example/?url={url}` |
 | `send_cover` | `true` | 发送封面图 |
 | `send_video` | `false` | 下载并发送视频 |
 | `max_video_mb` | `30` | 视频大小上限，`0` 不限 |
@@ -190,6 +193,15 @@ https://your-parse-api.example.com/bili?url={url}
 - **base64 超限会自动降清晰度**：本地路径发送失败且文件超过 `video_base64_max_mb` 时，插件会依次用 360P / 最低清晰度重新下载，再以 base64 发送，尽量让视频能发出去
 - 视频文件会在发送后延迟 10 分钟清理，启动时也会清理一天前的缓存，不会一直占磁盘
 - 解析失败时默认静默（`show_error` 可打开），日志里仍有详细记录
+
+### 为什么不能「直接让第三方解析接口返回图片/视频」
+
+第三方解析接口（星之阁等）返回的是 **B 站 CDN 上的签名 URL**，它们并不托管图片和视频。所以：
+
+- **封面**：插件支持 `cover_proxy`，默认用公开图片代理 `images.weserv.nl`：由代理服务器抓取 B 站封面并缩到 640px 再返回（约 13KB），小于常见的截断阈值，能完整拿到；
+- **视频**：没有公开的「视频托管/代理」服务，`video_proxy` 留给你填自己的代理模板；如果不配置，视频仍需要从 B 站 CDN 直接下载，服务器网络受限时无法绕过。
+
+插件绝不会把截断的图片或十几 KB 的初始化分片当成成品发送。
 
 ### 所有 CDN 地址都只返回十几 KB 的 MP4
 

@@ -46,6 +46,10 @@ PLUGIN_NAME = "astrbot_plugin_bili_parser"
 # 常量
 # ---------------------------------------------------------------------------
 
+DEFAULT_COVER_PROXY = (
+    "https://images.weserv.nl/?url={host_path}&w=640&output=jpg"
+)
+
 DEFAULT_CARD_TEMPLATE = (
     "【{title}】\n"
     "UP主：{up} · 时长：{duration}\n"
@@ -894,11 +898,35 @@ class BiliParserPlugin(Star):
 
     # -- 媒体 ---------------------------------------------------------------
     @staticmethod
-    def _cover_candidates(cover: str) -> list[tuple[str, dict]]:
+    def _wrap_proxy(template: str, url: str) -> str:
+        """把媒体地址套进第三方代理模板。
+
+        可用占位符：
+        * {url}      完整地址（URL 编码）
+        * {raw_url}  完整地址（不编码）
+        * {host_path} 去掉协议的 host+path（weserv 等代理常用）
+        """
+        if not template or not url:
+            return ""
+        try:
+            parsed = urlparse(url)
+            host_path = parsed.netloc + parsed.path
+            if parsed.query:
+                host_path += "?" + parsed.query
+            return template.format(
+                url=quote(url, safe=""),
+                raw_url=url,
+                host_path=quote(host_path, safe="/?=&:@"),
+            )
+        except Exception:
+            return ""
+
+    def _cover_candidates(self, cover: str) -> list[tuple[str, dict]]:
         """封面的多种候选地址。
 
         B 站图片 CDN 支持 `@宽_高_裁剪` 缩略图语法。部分服务器网络会把响应
-        截断在 32KB 左右，此时请求一张更小的缩略图反而能完整拿到。
+        截断在 32KB 左右，此时请求一张更小的缩略图反而能完整拿到；如果直连
+        怎么都不行，就交给第三方图片代理（由代理服务器去抓 B 站，返回小图）。
         """
         image_headers = {
             "User-Agent": BILI_HEADERS["User-Agent"],
@@ -917,6 +945,20 @@ class BiliParserPlugin(Star):
             candidates.append((base + suffix, image_headers))
         if cover.startswith("https://"):
             candidates.append((cover.replace("https://", "http://", 1), image_headers))
+
+        # 第三方图片代理兜底（配置为空字符串表示关闭）
+        raw_proxy = self.config.get("cover_proxy")
+        if raw_proxy is None:
+            proxy_template = DEFAULT_COVER_PROXY
+        else:
+            proxy_template = str(raw_proxy).strip()
+        if proxy_template:
+            seen: set[str] = set()
+            for source in (base, cover, base + "@480w_270h_1c.jpg"):
+                wrapped = self._wrap_proxy(proxy_template, source)
+                if wrapped and wrapped not in seen:
+                    seen.add(wrapped)
+                    candidates.append((wrapped, image_headers))
         return candidates
 
     async def _cover_component(self, video: BiliVideo):
@@ -1173,6 +1215,18 @@ class BiliParserPlugin(Star):
                 urls.append(result.video_url)
         return urls
 
+    def _add_video_proxy(self, urls: list[str]) -> list[str]:
+        """给视频地址追加第三方代理候选（配置了 video_proxy 时）。"""
+        template = str(self.config.get("video_proxy") or "").strip()
+        if not template or not urls:
+            return urls
+        out = list(urls)
+        for url in list(urls):
+            wrapped = self._wrap_proxy(template, url)
+            if wrapped and wrapped not in out:
+                out.append(wrapped)
+        return out
+
     async def _download_video(
         self,
         video: BiliVideo,
@@ -1204,7 +1258,9 @@ class BiliParserPlugin(Star):
         if video.bvid:
             headers["Referer"] = f"https://www.bilibili.com/video/{video.bvid}"
 
-        candidates = list(self._candidate_video_urls(video.video_url))
+        candidates = self._add_video_proxy(
+            list(self._candidate_video_urls(video.video_url))
+        )
         tried_durl = False
         tried_providers = False
         while True:
@@ -1247,6 +1303,7 @@ class BiliParserPlugin(Star):
                     candidates = []
                     for item in durl_urls:
                         candidates.extend(self._candidate_video_urls(item))
+                    candidates = self._add_video_proxy(candidates)
                     logger.info(
                         "[bili] 直链下载失败，改用 durl 地址重试（%d 个）",
                         len(candidates),
@@ -1260,6 +1317,7 @@ class BiliParserPlugin(Star):
                     candidates = []
                     for item in provider_urls:
                         candidates.extend(self._candidate_video_urls(item))
+                    candidates = self._add_video_proxy(candidates)
                     logger.info(
                         "[bili] 官方直链不可用，改用第三方接口直链重试（%d 个）",
                         len(candidates),

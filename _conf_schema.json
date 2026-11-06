@@ -61,6 +61,18 @@
     "default": true,
     "hint": "很多服务器 IPv6 出网不通，表现为图片只下载到 32KB、视频只下载到十几 KB。开启后会强制 IPv4；如果你的服务器只有 IPv6，请关闭。"
   },
+  "cover_proxy": {
+    "description": "封面图片代理",
+    "type": "string",
+    "default": "https://images.weserv.nl/?url={host_path}&w=640&output=jpg",
+    "hint": "直连 B 站图片被截断时，用第三方图片代理抓取并缩放。支持 {url} / {raw_url} / {host_path} 占位符；留空则关闭。"
+  },
+  "video_proxy": {
+    "description": "视频下载代理模板",
+    "type": "string",
+    "default": "",
+    "hint": "可选。例如 https://your-proxy.example.com/?url={url}，用于绕开 B 站 CDN 对服务器 IP 的限制；留空关闭。"
+  },
   "send_cover": {
     "description": "发送封面图",
     "type": "bool",

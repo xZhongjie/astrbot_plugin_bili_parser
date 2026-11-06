@@ -1617,15 +1617,19 @@ class BiliParserPlugin(Star):
     async def _collect_video_links(
         self, video: BiliVideo, target: BiliTarget
     ) -> list[tuple[str, str]]:
-        """解析出可用于外部下载的视频直链（不下载视频本身）。
+        """解析出可用于播放/下载的视频直链（不下载视频本身）。
 
-        优先返回第三方下载代理给出的地址（kukutool/maxhelper 等），
-        代理不可用时回退到 B 站签名直链。
+        * 在线播放：B 站签名直链，浏览器可以直接播放（代理链接带
+          `Content-Disposition: attachment`，只会触发下载）
+        * 下载：第三方代理直链
+
+        由 `link_output` 控制输出哪种，默认两种都输出。
         """
         if self.http is None:
             return []
         self._ensure_cid(video)
         qn = int(self.config.get("video_quality") or 64)
+        mode = str(self.config.get("link_output") or "both").strip().lower()
         links: list[tuple[str, str]] = []
         seen: set[str] = set()
 
@@ -1640,16 +1644,25 @@ class BiliParserPlugin(Star):
         if not video.video_url:
             await self._fill_play_url(video)
 
-        # 1) 第三方代理直链（优先）
-        if video.video_url and self._proxy_endpoints():
+        bili_mp4 = ""
+        if mode in ("play", "both"):
+            try:
+                bili_mp4 = await self._request_play_url(video, qn, 1)
+            except Exception as exc:
+                logger.info("[bili] 获取播放直链失败：%s", self._brief(exc))
+            if not bili_mp4:
+                bili_mp4 = video.video_url
+            add("在线播放", bili_mp4)
+
+        if mode in ("download", "both") and self._proxy_endpoints():
             try:
                 proxied = await self._resolve_proxy_url(video.video_url, target)
                 if proxied:
-                    add("第三方代理", proxied)
+                    add("下载（第三方代理）", proxied)
             except Exception as exc:
                 logger.info("[bili] 获取第三方代理直链失败：%s", self._brief(exc))
 
-        # 2) 没有代理地址时，回退 B 站签名直链
+        # 都没拿到时回退 B 站直链
         if not links:
             if video.video_url:
                 add("原始直链", video.video_url)
@@ -1897,9 +1910,12 @@ class BiliParserPlugin(Star):
         targets = await self.extract_targets(text)
         if not targets:
             return
+        # v4.29 的语义：event.call_llm=True 才是「禁止默认 LLM」
+        # （流水线条件是 `not event.call_llm`），所以这里必须设 True。
         if self.config.get("suppress_llm", True):
             try:
-                event.should_call_llm(False)
+                event.call_llm = True
+                event.should_call_llm(True)
             except Exception:
                 pass
 

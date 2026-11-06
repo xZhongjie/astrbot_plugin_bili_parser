@@ -70,7 +70,7 @@ git clone https://github.com/xZhongjie/astrbot_plugin_bili_parser.git
 
 ## 只返回解析后的链接
 
-如果不想让机器人下载并发送视频，只想拿到**第三方下载代理返回的直链**（自己用 IDM/aria2 下），打开：
+如果不想让机器人下载并发送视频，只想拿到视频直链（在线看或自己用 IDM/aria2 下），打开：
 
 ```
 插件配置 → 只返回解析后的视频直链（attach_video_links）
@@ -80,15 +80,17 @@ git clone https://github.com/xZhongjie/astrbot_plugin_bili_parser.git
 
 ```
 视频直链：
-第三方代理：https://redown1.maxhelper.app/v1/download/video?token=...
+在线播放：https://upos-sz-...mp4
+下载（第三方代理）：https://redown1.maxhelper.app/v1/download/video?token=...
 ```
 
 说明：
 
-- 优先调用「视频下载代理接口列表」里的接口，输出它返回的代理直链；代理都不可用时才回退 B 站签名直链（会显示 `原始直链 / MP4 / DASH` 多条）
+- **在线播放**：B 站签名直链，浏览器点开可以直接播放（约 2 小时有效，可能绑定请求 IP）
+- **下载（第三方代理）**：kukutool/maxhelper 返回的代理直链，响应头是 `Content-Disposition: attachment`，点开会下载文件而不是播放
+- 用「直链输出内容」（`link_output`）控制：播放 + 下载 / 仅在线播放 / 仅下载
 - 会忽略「下载并发送视频」，不产生下载流量
-- B 站直链带签名，**约 2 小时有效**，且通常绑定请求时的 IP（换网络可能 403）；第三方代理直链有效期由对方服务决定
-- 需要视频信息接口能正常解析，否则直链也会拿不到
+- 代理不可用时只输出 B 站直链
 
 ---
 
@@ -115,6 +117,7 @@ git clone https://github.com/xZhongjie/astrbot_plugin_bili_parser.git
 | `send_cover` | `true` | 发送封面图 |
 | `send_video` | `false` | 下载并发送视频 |
 | `attach_video_links` | `false` | 只返回解析后的视频直链，不下载发送视频 |
+| `link_output` | `both` | 直链内容：`both` / `play`（在线播放）/ `download`（代理下载） |
 | `max_video_mb` | `30` | 视频大小上限，`0` 不限 |
 | `video_send_mode` | `auto` | 视频发送方式：`auto` / `base64` / `file` |
 | `video_base64_max_mb` | `20` | 不超过该大小时用 base64 发送，避免协议端找不到本地文件 |

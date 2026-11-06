@@ -73,11 +73,19 @@
     "default": false,
     "hint": "开启后跳过直连 CDN、镜像、durl 等尝试，直接把视频地址交给 video_proxy_api 代理下载；代理失败会自动回退直连。"
   },
+  "link_output": {
+    "description": "直链输出内容",
+    "type": "string",
+    "default": "both",
+    "options": ["both", "play", "download"],
+    "labels": ["播放 + 下载", "仅在线播放", "仅下载"],
+    "hint": "第三方代理链接带 Content-Disposition: attachment，浏览器点开会下载；在线播放使用 B 站签名直链。"
+  },
   "attach_video_links": {
     "description": "只返回解析后的视频直链",
     "type": "bool",
     "default": false,
-    "hint": "开启后不下载、不发送视频，而是输出第三方下载代理返回的直链（代理不可用时回退 B 站签名直链）。开启时会忽略「下载并发送视频」。"
+    "hint": "开启后不下载、不发送视频，直链单独成条发送。直链内容由「直链输出内容」控制：可输出可在线播放的 B 站直链、第三方代理下载直链，或两者都输出。"
   },
   "video_proxy_apis": {
     "description": "视频下载代理接口列表",

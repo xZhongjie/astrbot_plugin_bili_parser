@@ -880,16 +880,52 @@ class BiliParserPlugin(Star):
     async def _cover_component(self, video: BiliVideo):
         if not video.cover or self.http is None:
             return None
-        data = await self.http.get_bytes(
-            video.cover, headers=BILI_HEADERS, timeout=20
+
+        image_headers = {
+            "User-Agent": BILI_HEADERS["User-Agent"],
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        }
+        data = None
+        # 依次尝试：带 B站 Referer → 只带 UA → 换成 http
+        for candidate_url, headers in (
+            (video.cover, BILI_HEADERS),
+            (video.cover, image_headers),
+            (
+                video.cover.replace("https://", "http://", 1)
+                if video.cover.startswith("https://")
+                else "",
+                image_headers,
+            ),
+        ):
+            if not candidate_url:
+                continue
+            data = await self.http.get_bytes(
+                candidate_url, headers=headers, timeout=20
+            )
+            if data:
+                break
+        if not data:
+            logger.warning("[bili] 封面下载失败，跳过封面：%s", video.cover[:120])
+            return None
+
+        # B站封面经常是 WebP / AVIF / 带透明通道，部分 QQ 客户端会解码不全
+        # （表现为下半截灰色），统一转成 JPEG 再发。
+        normalized = await asyncio.to_thread(self._normalize_cover, data)
+        if not normalized:
+            # 下载到的不是有效图片（可能是防盗链返回的错误页），宁可不发，
+            # 也不要发一张灰色破图。
+            logger.warning(
+                "[bili] 封面不是有效图片（%d 字节，文件头 %s），跳过封面",
+                len(data),
+                data[:16].hex(),
+            )
+            return None
+        logger.debug(
+            "[bili] 封面已转码：%d 字节 -> %d 字节 JPEG",
+            len(data),
+            len(normalized),
         )
-        if data:
-            # B站封面经常是 WebP / AVIF / 带透明通道，部分 QQ 客户端会解码不全
-            # （表现为下半截灰色），统一转成 JPEG 再发。
-            normalized = await asyncio.to_thread(self._normalize_cover, data)
-            payload = normalized or data
-            return Comp.Image.fromBase64(base64.b64encode(payload).decode())
-        return Comp.Image.fromURL(video.cover)
+        return Comp.Image.fromBase64(base64.b64encode(normalized).decode())
 
     @staticmethod
     def _normalize_cover(data: bytes) -> bytes | None:
@@ -986,7 +1022,67 @@ class BiliParserPlugin(Star):
         if video.video_url:
             logger.info("[bili] 已获取视频直链（qn=%s）", qn)
 
-    async def _download_video(self, video: BiliVideo) -> str | None:
+    @staticmethod
+    def _looks_like_mp4(data: bytes) -> bool:
+        return len(data) > 12 and data[4:8] == b"ftyp"
+
+    async def _playurl_durl_urls(self, video: BiliVideo) -> list[str]:
+        """直链下载失败时的兜底：用 fnval=1 取普通 MP4 的 durl 地址。"""
+        if self.http is None or not (video.bvid or video.aid):
+            return []
+        qn = int(self.config.get("video_quality") or 64)
+        if video.bvid:
+            url = (
+                "https://api.bilibili.com/x/player/playurl"
+                f"?bvid={video.bvid}&cid={video.cid}&qn={qn}&fnval=1&fourk=1"
+            )
+        else:
+            url = (
+                "https://api.bilibili.com/x/player/playurl"
+                f"?avid={video.aid}&cid={video.cid}&qn={qn}&fnval=1&fourk=1"
+            )
+        headers = dict(BILI_HEADERS)
+        headers["Cookie"] = self._cookie()
+        status, payload = await self.http.get_json(url, headers=headers, timeout=15)
+        if status != 200 or not isinstance(payload, dict):
+            return []
+        data = payload.get("data") or {}
+        urls = [
+            str(item.get("url") or "").strip()
+            for item in (data.get("durl") or [])
+            if isinstance(item, dict)
+        ]
+        return [item for item in urls if item.startswith(("http://", "https://"))]
+
+    async def _provider_video_urls(self, target: BiliTarget) -> list[str]:
+        """直链全失败时，再向第三方接口要一次视频直链。"""
+        if self.http is None:
+            return []
+        urls: list[str] = []
+        for provider in self.providers:
+            if not provider.get("enabled", True):
+                continue
+            if provider["type"] == "official":
+                continue
+            try:
+                result = await asyncio.wait_for(
+                    self._query_provider(provider, target),
+                    timeout=float(provider.get("timeout") or 12) + 2,
+                )
+            except Exception as exc:
+                logger.info(
+                    "[bili] 备用接口 %s 获取视频直链失败：%s",
+                    provider["name"],
+                    self._brief(exc),
+                )
+                continue
+            if result is not None and result.video_url:
+                urls.append(result.video_url)
+        return urls
+
+    async def _download_video(
+        self, video: BiliVideo, target: BiliTarget | None = None
+    ) -> str | None:
         if self.http is None or self._data_dir is None:
             return None
         await self._fill_play_url(video)
@@ -998,23 +1094,71 @@ class BiliParserPlugin(Star):
         max_bytes = max_mb * 1024 * 1024 if max_mb > 0 else 0
         headers = dict(BILI_HEADERS)
         headers["Accept"] = "video/*,*/*;q=0.8"
-        for candidate in self._candidate_video_urls(video.video_url):
-            data = await self.http.get_bytes(candidate, headers=headers, timeout=180)
-            if not data:
-                continue
-            if max_bytes and len(data) > max_bytes:
-                logger.info(
-                    "[bili] 视频 %.1fMB 超过 %dMB 上限，跳过",
-                    len(data) / 1024 / 1024,
-                    max_mb,
+
+        candidates = list(self._candidate_video_urls(video.video_url))
+        tried_durl = False
+        tried_providers = False
+        while True:
+            for candidate in candidates:
+                data = await self.http.get_bytes(
+                    candidate, headers=headers, timeout=180
                 )
-                return None
-            path = self._data_dir / (
-                f"bili_{int(time.time())}_{random.randint(1000, 9999)}.mp4"
-            )
-            await asyncio.to_thread(path.write_bytes, data)
-            logger.info("[bili] 视频已下载：%.1fMB", len(data) / 1024 / 1024)
-            return str(path)
+                if not data:
+                    continue
+                # 关键校验：CDN 有时会返回 200 + 错误页/JSON，直接当视频发出去
+                # 就会变成「1 秒黑屏」。这里必须确认是真正的 MP4。
+                if not self._looks_like_mp4(data):
+                    logger.warning(
+                        "[bili] 视频地址返回的不是 MP4（%d 字节，文件头 %s），"
+                        "可能被 CDN 拦截，尝试下一个地址：%s",
+                        len(data),
+                        data[:12].hex(),
+                        candidate[:100],
+                    )
+                    continue
+                if max_bytes and len(data) > max_bytes:
+                    logger.info(
+                        "[bili] 视频 %.1fMB 超过 %dMB 上限，跳过",
+                        len(data) / 1024 / 1024,
+                        max_mb,
+                    )
+                    return None
+                path = self._data_dir / (
+                    f"bili_{int(time.time())}_{random.randint(1000, 9999)}.mp4"
+                )
+                await asyncio.to_thread(path.write_bytes, data)
+                logger.info("[bili] 视频已下载：%.1fMB", len(data) / 1024 / 1024)
+                return str(path)
+
+            if not tried_durl:
+                tried_durl = True
+                durl_urls = await self._playurl_durl_urls(video)
+                if durl_urls:
+                    candidates = []
+                    for item in durl_urls:
+                        candidates.extend(self._candidate_video_urls(item))
+                    logger.info(
+                        "[bili] 直链下载失败，改用 durl 地址重试（%d 个）",
+                        len(candidates),
+                    )
+                    continue
+
+            if not tried_providers and target is not None:
+                tried_providers = True
+                provider_urls = await self._provider_video_urls(target)
+                if provider_urls:
+                    candidates = []
+                    for item in provider_urls:
+                        candidates.extend(self._candidate_video_urls(item))
+                    logger.info(
+                        "[bili] 官方直链不可用，改用第三方接口直链重试（%d 个）",
+                        len(candidates),
+                    )
+                    continue
+
+            break
+
+        logger.warning("[bili] 所有视频地址都下载失败（可能被 B 站 CDN 拦截）")
         return None
 
     async def build_chain(
@@ -1032,7 +1176,7 @@ class BiliParserPlugin(Star):
 
         temp_path: str | None = None
         if allow_video and self.config.get("send_video"):
-            temp_path = await self._download_video(video)
+            temp_path = await self._download_video(video, target)
             if temp_path:
                 # 不能在这里立刻删除：AstrBot 的 respond 阶段是在插件处理器
                 # 结束后才真正发送，提前删文件会导致协议端 ENOENT。
@@ -1224,6 +1368,12 @@ class BiliParserPlugin(Star):
             if temp:
                 # QQ 要求 video 段单独成条，不能和卡片混发
                 await self._send_video(event, temp)
+            elif self.config.get("send_video"):
+                await self._send_plain(
+                    event,
+                    "视频下载失败：B 站 CDN 返回的不是有效视频（可能被拦截），"
+                    "卡片信息已发送，详见插件日志。",
+                )
 
     @filter.command("bili", alias={"b站解析", "哔哩哔哩解析"})
     async def bili(self, event: AstrMessageEvent, args: GreedyStr):
@@ -1257,6 +1407,12 @@ class BiliParserPlugin(Star):
                 await self._send_plain(event, self.render_card(video, target))
             if temp:
                 await self._send_video(event, temp)
+            elif self.config.get("send_video"):
+                await self._send_plain(
+                    event,
+                    "视频下载失败：B 站 CDN 返回的不是有效视频（可能被拦截），"
+                    "卡片信息已发送，详见插件日志。",
+                )
 
     @filter.command("bili_status")
     async def bili_status(self, event: AstrMessageEvent):
@@ -1298,6 +1454,7 @@ class BiliParserPlugin(Star):
             "支持：bilibili.com/video/BV...、av...、b23.tv 短链、?p= 分P、单独 BV 号。\n"
             "解析接口可在 WebUI 插件配置里增删，支持并行竞速与顺序回退。"
         )
+
 
 
 

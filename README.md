@@ -176,6 +176,7 @@ https://your-parse-api.example.com/bili?url={url}
 - 官方接口只能给信息，视频直链要下载时再调 `playurl`，未登录时清晰度可能被限制
 - 第三方免费接口随时可能失效，插件会在日志里打印每个接口的失败原因
 - 视频下载会占用内存与磁盘，默认关闭；大群建议保持关闭
+- **视频会作为单独一条消息发送**：QQ / OneBot 要求 `video` 段不能与文字、图片混在同一条消息里（否则报 `retcode 1400: message element "video" must be the only segment`）。如果 AstrBot 与 QQ 协议端不在同一文件系统，请配置 AstrBot 的 `callback_api_base`，插件会把本地视频转成 HTTP 链接再发送；否则请保持 `send_video` 关闭
 - 解析失败时默认静默（`show_error` 可打开），日志里仍有详细记录
 
 ---

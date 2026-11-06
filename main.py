@@ -980,9 +980,22 @@ class BiliParserPlugin(Star):
         temp_path: str | None = None
         if allow_video and self.config.get("send_video"):
             temp_path = await self._download_video(video)
-            if temp_path:
-                chain.append(Comp.Video.fromFileSystem(temp_path))
         return chain, temp_path
+
+    @staticmethod
+    def _video_chain(temp_path: str) -> list[Any]:
+        """视频必须单独成条发送。
+
+        OneBot / QQ（NapCat 等）要求 message 里 video 段不能和其它段混发，
+        否则会返回 retcode 1400：message element "video" must be the only segment。
+        因此这里返回只含一个 Video 组件的消息链。
+
+        使用普通绝对路径而不是 file:// URI，方便 AstrBot 在配置了
+        callback_api_base 时自动转成可访问的 HTTP 链接，也避免部分协议端
+        不识别 file:// 前缀。
+        """
+        return [Comp.Video(file=temp_path, path=temp_path)]
+
 
     # -- 事件 ---------------------------------------------------------------
     def _cooldown_hit(self, event: AstrMessageEvent, target: BiliTarget) -> bool:
@@ -1070,6 +1083,9 @@ class BiliParserPlugin(Star):
             chain, temp = await self.build_chain(video, target)
             try:
                 yield event.chain_result(chain)
+                if temp:
+                    # QQ 要求 video 段单独成条，不能和卡片混发
+                    yield event.chain_result(self._video_chain(temp))
             finally:
                 if temp:
                     Path(temp).unlink(missing_ok=True)
@@ -1103,6 +1119,8 @@ class BiliParserPlugin(Star):
             chain, temp = await self.build_chain(video, target)
             try:
                 yield event.chain_result(chain)
+                if temp:
+                    yield event.chain_result(self._video_chain(temp))
             finally:
                 if temp:
                     Path(temp).unlink(missing_ok=True)

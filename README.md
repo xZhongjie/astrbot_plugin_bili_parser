@@ -85,7 +85,8 @@ git clone https://github.com/xZhongjie/astrbot_plugin_bili_parser.git
 | `cover_proxy` | weserv 图片代理 | 封面直连失败时，用第三方图片代理抓取并缩放；留空关闭 |
 | `video_proxy` | 空 | 视频下载代理模板，例如 `https://proxy.example/?url={url}` |
 | `video_proxy_first` | `false` | 直接使用第三方下载代理，跳过直连尝试 |
-| `video_proxy_api` | kukutool 接口 | 第三方视频下载代理接口，留空关闭 |
+| `video_proxy_apis` | kukutool | 视频下载代理接口列表，多个接口并行测速选最快 |
+| `video_proxy_api` | 空 | 旧版单接口，保留兼容；填了也参与测速 |
 | `download_chunk_kb` | `2048` | Range 分片下载大小，`0` 关闭分片 |
 | `send_cover` | `true` | 发送封面图 |
 | `send_video` | `false` | 下载并发送视频 |
@@ -210,7 +211,7 @@ https://your-parse-api.example.com/bili?url={url}
 
 公开的「视频代理」基本不存在：通用 CORS 代理（allorigins、codetabs 等）通常限制 5MB 左右、不保证 Range 和视频流，20MB 的视频拉不下来。插件内置了两种可用方案：
 
-0. **第三方下载代理接口（默认开启）**：`video_proxy_api` 默认指向 `https://dy.kukutool.com/api/download-proxy-url`（kukutool / maxhelper 的公开接口）。直连 CDN 失败时，插件 POST `{url, sourceUrl, type}` 拿到代理地址，再用 **HTTP Range 分片**下载（实测 1MB/片，21.5MB 视频可以完整取回）。注意：这是第三方非官方接口，随时可能失效，且会把视频地址发送给该服务；介意隐私可以留空关闭。
+0. **第三方下载代理接口（默认开启）**：内置 `https://dy.kukutool.com/api/download-proxy-url`（kukutool / maxhelper）。直连 CDN 失败时，插件 POST `{url, sourceUrl, type}` 拿到代理地址，再用 **HTTP Range 分片**下载。可以在「视频下载代理接口列表」里添加多个同类接口，插件会**并行测速**（每个接口取一次代理地址并 Range 探测 64KB），自动选用最快且可用的一个并缓存 10 分钟。注意：第三方非官方接口随时可能失效，且会把视频地址发送给该服务；介意隐私可清空列表关闭。
 1. **HTTP 代理（推荐自建）**：VPS 上跑 3proxy / Squid / mihomo，插件配置填 `proxy: http://user:pass@vps:port`。插件会让 **playurl 和视频下载走同一个出口 IP**，签名一致，B 站 CDN 就不会只返回初始化分片。
 2. **大陆 VPS + nginx 反代**：见 `proxy-examples/nginx.conf`，部署后填 `video_proxy: https://你的域名/bili-proxy?url={url}`。
 3. **Cloudflare Worker**：见 `cloudflare-worker/worker.js`，免费、部署快；但出口 IP 通常在海外，B 站可能同样只给初始化分片。

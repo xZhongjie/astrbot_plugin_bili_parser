@@ -639,6 +639,7 @@ class BiliParserPlugin(Star):
         self.providers: list[dict] = self._load_providers()
         self._buvid3 = ""
         self._recent: dict[str, float] = {}
+        self._proxy_endpoint_cache: tuple[str, float] | None = None
         self._data_dir: Path | None = None
         self._initialized = False
 
@@ -1356,20 +1357,122 @@ class BiliParserPlugin(Star):
             "sourceUrl": target.canonical_url if target is not None else "",
             "type": "video",
         }
+        try:
+            parsed = urlparse(api_url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            origin = ""
         status, data = await self.http.post_json(
             api_url,
             payload,
             headers={
-                "Origin": "https://dy.kukutool.com",
-                "Referer": "https://dy.kukutool.com/bilibili",
+                "Origin": origin,
+                "Referer": origin + "/" if origin else "",
             },
         )
         if status == 200 and isinstance(data, dict):
             url = data.get("url")
             if isinstance(url, str) and url.startswith(("http://", "https://")):
                 return url
-        logger.info("[bili] 视频代理接口未返回可用地址（status=%s）", status)
+        logger.info("[bili] 视频代理接口 %s 未返回可用地址（status=%s）", api_url, status)
         return ""
+
+    def _proxy_endpoints(self) -> list[tuple[str, str]]:
+        """收集所有启用的视频下载代理接口（名称, 地址）。"""
+        endpoints: list[tuple[str, str]] = []
+        legacy = str(self.config.get("video_proxy_api") or "").strip()
+        if legacy:
+            endpoints.append(("legacy", legacy))
+        raw = self.config.get("video_proxy_apis")
+        if isinstance(raw, list):
+            for index, item in enumerate(raw):
+                if not isinstance(item, dict) or not item.get("enabled", True):
+                    continue
+                url = str(item.get("url") or "").strip()
+                if not url:
+                    continue
+                name = str(item.get("name") or f"api-{index + 1}").strip()
+                endpoints.append((name, url))
+        seen: set[str] = set()
+        unique: list[tuple[str, str]] = []
+        for name, url in endpoints:
+            if url in seen:
+                continue
+            seen.add(url)
+            unique.append((name, url))
+        return unique
+
+    async def _probe_proxy_url(self, url: str) -> bool:
+        """快速验证代理地址可用（Range 取 64KB，确认是 MP4）。"""
+        if self.http is None:
+            return False
+        try:
+            status, body, _ = await self.http.request_full(
+                url,
+                headers={
+                    **BILI_HEADERS,
+                    "Accept": "video/*,*/*;q=0.8",
+                    "Range": "bytes=0-65535",
+                },
+                timeout=20,
+            )
+        except Exception:
+            return False
+        return status in (200, 206) and len(body) > 1024 and self._looks_like_mp4(body)
+
+    async def _resolve_proxy_url(
+        self, video_url: str, target: BiliTarget | None
+    ) -> str:
+        """在多个代理接口中测速，选用最快且可用的那个。"""
+        endpoints = self._proxy_endpoints()
+        if not endpoints or self.http is None:
+            return ""
+
+        now = time.time()
+        cached = self._proxy_endpoint_cache
+        cached_endpoint = cached[0] if cached else ""
+        if cached_endpoint and now - cached[1] < 600:
+            for _, url in endpoints:
+                if url == cached_endpoint:
+                    proxied = await self._proxy_media_url(url, video_url, target)
+                    if proxied and await self._probe_proxy_url(proxied):
+                        return proxied
+                    logger.info("[bili] 缓存的代理接口失效，重新测速")
+                    self._proxy_endpoint_cache = None
+                    break
+
+        async def attempt(name: str, api_url: str):
+            started = time.monotonic()
+            proxied = await self._proxy_media_url(api_url, video_url, target)
+            if not proxied:
+                return None
+            if not await self._probe_proxy_url(proxied):
+                return None
+            return (time.monotonic() - started, name, api_url, proxied)
+
+        results = await asyncio.gather(
+            *(attempt(name, url) for name, url in endpoints),
+            return_exceptions=True,
+        )
+        valid = [item for item in results if isinstance(item, tuple)]
+        if not valid:
+            logger.warning("[bili] 所有视频代理接口都不可用")
+            return ""
+
+        valid.sort(key=lambda item: item[0])
+        elapsed, name, api_url, proxied = valid[0]
+        self._proxy_endpoint_cache = (api_url, time.time())
+        logger.info(
+            "[bili] 代理接口测速：%s 最快（%.0fms），其余：%s",
+            name,
+            elapsed * 1000,
+            "、".join(
+                f"{item[1]} {item[0] * 1000:.0f}ms"
+                for item in valid[1:]
+            )
+            or "无",
+        )
+        return proxied
 
     async def _download_video(
         self,
@@ -1410,10 +1513,9 @@ class BiliParserPlugin(Star):
         tried_proxy_api = False
 
         # 开关：直接跳过直连尝试，优先交给第三方下载代理
-        proxy_api = str(self.config.get("video_proxy_api") or "").strip()
-        if bool(self.config.get("video_proxy_first")) and proxy_api:
+        if bool(self.config.get("video_proxy_first")) and self._proxy_endpoints():
             tried_proxy_api = True
-            proxied = await self._proxy_media_url(proxy_api, video.video_url, target)
+            proxied = await self._resolve_proxy_url(video.video_url, target)
             if proxied:
                 logger.info("[bili] 跳过直连，优先使用第三方下载代理：%s", proxied[:100])
                 data = await self._fetch_media(proxied, headers, max_bytes)
@@ -1496,10 +1598,9 @@ class BiliParserPlugin(Star):
 
             if not tried_proxy_api and target is not None:
                 tried_proxy_api = True
-                api_url = str(self.config.get("video_proxy_api") or "").strip()
-                if api_url:
-                    proxied = await self._proxy_media_url(
-                        api_url, video.video_url, target
+                if self._proxy_endpoints():
+                    proxied = await self._resolve_proxy_url(
+                        video.video_url, target
                     )
                     if proxied:
                         candidates = [proxied]

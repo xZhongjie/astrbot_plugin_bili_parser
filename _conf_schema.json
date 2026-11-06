@@ -73,11 +73,48 @@
     "default": false,
     "hint": "开启后跳过直连 CDN、镜像、durl 等尝试，直接把视频地址交给 video_proxy_api 代理下载；代理失败会自动回退直连。"
   },
+  "video_proxy_apis": {
+    "description": "视频下载代理接口列表",
+    "type": "template_list",
+    "default": [
+      {
+        "__template_key": "api",
+        "name": "kukutool",
+        "url": "https://dy.kukutool.com/api/download-proxy-url",
+        "enabled": true
+      }
+    ],
+    "hint": "可添加多个同类接口（POST {url, sourceUrl, type} 返回 {url}）。解析时会并行测速，自动选用最快且可用的一个，并缓存 10 分钟。",
+    "templates": {
+      "api": {
+        "name": "代理接口",
+        "hint": "第三方接口可能随时失效",
+        "display_item": "name",
+        "items": {
+          "name": {
+            "description": "接口名称",
+            "type": "string",
+            "default": "代理接口"
+          },
+          "url": {
+            "description": "接口地址",
+            "type": "string",
+            "default": ""
+          },
+          "enabled": {
+            "description": "启用",
+            "type": "bool",
+            "default": true
+          }
+        }
+      }
+    }
+  },
   "video_proxy_api": {
-    "description": "第三方视频下载代理接口",
+    "description": "旧版：单个视频下载代理接口",
     "type": "string",
-    "default": "https://dy.kukutool.com/api/download-proxy-url",
-    "hint": "直连 CDN 失败时，POST {url, sourceUrl, type} 到该接口，用返回的 url 代下视频。默认是 kukutool 的公开接口（可能失效，且会把视频地址发给第三方）；留空则关闭。"
+    "default": "",
+    "hint": "已由上面的「视频下载代理接口列表」取代，保留用于兼容；这里填了也会参与测速。"
   },
   "download_chunk_kb": {
     "description": "分片下载大小（KB）",

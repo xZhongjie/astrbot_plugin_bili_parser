@@ -1617,7 +1617,11 @@ class BiliParserPlugin(Star):
     async def _collect_video_links(
         self, video: BiliVideo, target: BiliTarget
     ) -> list[tuple[str, str]]:
-        """解析出可用于外部下载的视频直链（不下载视频本身）。"""
+        """解析出可用于外部下载的视频直链（不下载视频本身）。
+
+        优先返回第三方下载代理给出的地址（kukutool/maxhelper 等），
+        代理不可用时回退到 B 站签名直链。
+        """
         if self.http is None:
             return []
         self._ensure_cid(video)
@@ -1633,15 +1637,29 @@ class BiliParserPlugin(Star):
             seen.add(url)
             links.append((label, url))
 
-        if video.video_url:
-            add("原始直链", video.video_url)
-        try:
-            durl = await self._request_play_url(video, qn, 1)
-            add(f"{qn}P MP4", durl)
-            dash = await self._request_play_url(video, qn, 16)
-            add(f"{qn}P DASH", dash)
-        except Exception as exc:
-            logger.info("[bili] 获取视频直链失败：%s", self._brief(exc))
+        if not video.video_url:
+            await self._fill_play_url(video)
+
+        # 1) 第三方代理直链（优先）
+        if video.video_url and self._proxy_endpoints():
+            try:
+                proxied = await self._resolve_proxy_url(video.video_url, target)
+                if proxied:
+                    add("第三方代理", proxied)
+            except Exception as exc:
+                logger.info("[bili] 获取第三方代理直链失败：%s", self._brief(exc))
+
+        # 2) 没有代理地址时，回退 B 站签名直链
+        if not links:
+            if video.video_url:
+                add("原始直链", video.video_url)
+            try:
+                durl = await self._request_play_url(video, qn, 1)
+                add(f"{qn}P MP4", durl)
+                dash = await self._request_play_url(video, qn, 16)
+                add(f"{qn}P DASH", dash)
+            except Exception as exc:
+                logger.info("[bili] 获取视频直链失败：%s", self._brief(exc))
         return links[:3]
 
     async def build_chain(

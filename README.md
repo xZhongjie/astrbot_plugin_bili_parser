@@ -70,7 +70,7 @@ git clone https://github.com/xZhongjie/astrbot_plugin_bili_parser.git
 
 ## 只返回解析后的链接
 
-如果不想让机器人下载并发送视频，只想拿到 B 站解析出的直链（自己用 IDM/aria2 下），打开：
+如果不想让机器人下载并发送视频，只想拿到**第三方下载代理返回的直链**（自己用 IDM/aria2 下），打开：
 
 ```
 插件配置 → 只返回解析后的视频直链（attach_video_links）
@@ -79,16 +79,15 @@ git clone https://github.com/xZhongjie/astrbot_plugin_bili_parser.git
 开启后卡片后面会追加类似：
 
 ```
-视频直链（B站签名，约 2 小时有效）：
-原始直链：https://upos-sz-...mp4
-64P MP4：https://upos-sz-...mp4
-64P DASH：https://...m4s
+视频直链：
+第三方代理：https://redown1.maxhelper.app/v1/download/video?token=...
 ```
 
 说明：
 
+- 优先调用「视频下载代理接口列表」里的接口，输出它返回的代理直链；代理都不可用时才回退 B 站签名直链（会显示 `原始直链 / MP4 / DASH` 多条）
 - 会忽略「下载并发送视频」，不产生下载流量
-- 直链带 B 站签名，**约 2 小时有效**，且通常绑定请求时的 IP（换网络可能 403）
+- B 站直链带签名，**约 2 小时有效**，且通常绑定请求时的 IP（换网络可能 403）；第三方代理直链有效期由对方服务决定
 - 需要视频信息接口能正常解析，否则直链也会拿不到
 
 ---

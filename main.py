@@ -132,7 +132,7 @@ RE_VIDEO_URL = re.compile(
 RE_SHORT_URL = re.compile(
     r"https?://(?:b23\.tv|bili2233\.cn)/([0-9A-Za-z]+)", re.IGNORECASE
 )
-RE_BARE_BV = re.compile(r"\b(BV[0-9A-Za-z]{10})\b")
+RE_BARE_BV = re.compile(r"\b(BV[0-9A-Za-z]{10})\b", re.IGNORECASE)
 RE_ANY_URL = re.compile(r"https?://[^\s<>\"']+")
 RE_PAGE = re.compile(r"[?&]p=(\d+)", re.IGNORECASE)
 RE_DURATION = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2})$")
@@ -761,7 +761,7 @@ class BiliParserPlugin(Star):
         if not match:
             return None
         token = match.group(1)
-        bvid = token if token.lower().startswith("bv") else ""
+        bvid = f"BV{token[2:]}" if token.lower().startswith("bv") else ""
         aid = int(match.group(2)) if match.group(2) else 0
         page = 1
         query = parse_qs(parsed.query)
@@ -807,6 +807,8 @@ class BiliParserPlugin(Star):
         if not targets:
             for match in RE_BARE_BV.finditer(text):
                 bvid = match.group(1)
+                # 统一前缀大写，兼容用户手打的小写 bv
+                bvid = f"BV{bvid[2:]}"
                 target = BiliTarget(
                     bvid=bvid, url=f"https://www.bilibili.com/video/{bvid}"
                 )

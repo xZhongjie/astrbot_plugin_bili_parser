@@ -203,6 +203,16 @@ https://your-parse-api.example.com/bili?url={url}
 
 插件绝不会把截断的图片或十几 KB 的初始化分片当成成品发送。
 
+### 视频代理方案
+
+公开的「视频代理」基本不存在：通用 CORS 代理（allorigins、codetabs 等）通常限制 5MB 左右、不保证 Range 和视频流，20MB 的视频拉不下来。稳定方案有三种，任选其一：
+
+1. **HTTP 代理（推荐）**：VPS 上跑 3proxy / Squid / mihomo，插件配置填 `proxy: http://user:pass@vps:port`。插件会让 **playurl 和视频下载走同一个出口 IP**，签名一致，B 站 CDN 就不会只返回初始化分片。
+2. **大陆 VPS + nginx 反代**：见 `proxy-examples/nginx.conf`，部署后填 `video_proxy: https://你的域名/bili-proxy?url={url}`。
+3. **Cloudflare Worker**：见 `cloudflare-worker/worker.js`，免费、部署快；但出口 IP 通常在海外，B 站可能同样只给初始化分片。
+
+`video_proxy` 支持 `{url}`（URL 编码）、`{raw_url}`、`{host_path}` 三种占位符；`cover_proxy` 同理。
+
 ### 所有 CDN 地址都只返回十几 KB 的 MP4
 
 说明 B 站视频 CDN 对你的服务器 IP 只返回了初始化分片（常见于海外服务器、被风控的 IP、或 API 与下载走了不同出口 IP）。插件会判定失败并尝试镜像 / `durl` / 第三方接口，如果全部如此：

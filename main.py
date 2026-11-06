@@ -1662,6 +1662,17 @@ class BiliParserPlugin(Star):
                 logger.info("[bili] 获取视频直链失败：%s", self._brief(exc))
         return links[:3]
 
+    async def _send_video_links(
+        self, event: AstrMessageEvent, video: BiliVideo, target: BiliTarget
+    ) -> None:
+        """把解析出的视频直链作为单独一条消息发送。"""
+        links = await self._collect_video_links(video, target)
+        if not links:
+            logger.info("[bili] 没有可用的视频直链")
+            return
+        body = "\n".join(f"{label}：{url}" for label, url in links)
+        await self._send_plain(event, f"视频直链：\n{body}")
+
     async def build_chain(
         self, video: BiliVideo, target: BiliTarget, *, allow_video: bool = True
     ) -> tuple[list[Any], str | None]:
@@ -1675,15 +1686,7 @@ class BiliParserPlugin(Star):
         if text:
             chain.append(Comp.Plain(text))
 
-        # 只输出解析直链模式
-        if bool(self.config.get("attach_video_links")):
-            links = await self._collect_video_links(video, target)
-            if links:
-                body = "\n".join(f"{label}：{url}" for label, url in links)
-                chain.append(
-                    Comp.Plain(f"视频直链（B站签名，约 2 小时有效）：\n{body}")
-                )
-
+        # 只输出解析直链模式：直链由调用方单独发送，不混在卡片里
         temp_path: str | None = None
         if allow_video:
             temp_path = await self._download_video(video, target)
@@ -1935,6 +1938,9 @@ class BiliParserPlugin(Star):
                     "视频下载失败：B 站 CDN 返回的不是有效视频（可能被拦截），"
                     "卡片信息已发送，详见插件日志。",
                 )
+            if attach_links:
+                # 直链单独发一条，不和卡片混在一起
+                await self._send_video_links(event, video, target)
 
     @filter.command("bili", alias={"b站解析", "哔哩哔哩解析"})
     async def bili(self, event: AstrMessageEvent, args: GreedyStr):
@@ -1979,6 +1985,8 @@ class BiliParserPlugin(Star):
                     "视频下载失败：B 站 CDN 返回的不是有效视频（可能被拦截），"
                     "卡片信息已发送，详见插件日志。",
                 )
+            if attach_links:
+                await self._send_video_links(event, video, target)
 
     @filter.command("bili_status")
     async def bili_status(self, event: AstrMessageEvent):

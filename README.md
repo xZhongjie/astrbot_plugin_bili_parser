@@ -76,7 +76,7 @@ git clone https://github.com/xZhongjie/astrbot_plugin_bili_parser.git
 插件配置 → 只返回解析后的视频直链（attach_video_links）
 ```
 
-开启后卡片后面会追加类似：
+开启后**卡片和直链分两条消息发送**，直链消息类似：
 
 ```
 视频直链：

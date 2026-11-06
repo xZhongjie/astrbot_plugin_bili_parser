@@ -205,9 +205,10 @@ https://your-parse-api.example.com/bili?url={url}
 
 ### 视频代理方案
 
-公开的「视频代理」基本不存在：通用 CORS 代理（allorigins、codetabs 等）通常限制 5MB 左右、不保证 Range 和视频流，20MB 的视频拉不下来。稳定方案有三种，任选其一：
+公开的「视频代理」基本不存在：通用 CORS 代理（allorigins、codetabs 等）通常限制 5MB 左右、不保证 Range 和视频流，20MB 的视频拉不下来。插件内置了两种可用方案：
 
-1. **HTTP 代理（推荐）**：VPS 上跑 3proxy / Squid / mihomo，插件配置填 `proxy: http://user:pass@vps:port`。插件会让 **playurl 和视频下载走同一个出口 IP**，签名一致，B 站 CDN 就不会只返回初始化分片。
+0. **第三方下载代理接口（默认开启）**：`video_proxy_api` 默认指向 `https://dy.kukutool.com/api/download-proxy-url`（kukutool / maxhelper 的公开接口）。直连 CDN 失败时，插件 POST `{url, sourceUrl, type}` 拿到代理地址，再用 **HTTP Range 分片**下载（实测 1MB/片，21.5MB 视频可以完整取回）。注意：这是第三方非官方接口，随时可能失效，且会把视频地址发送给该服务；介意隐私可以留空关闭。
+1. **HTTP 代理（推荐自建）**：VPS 上跑 3proxy / Squid / mihomo，插件配置填 `proxy: http://user:pass@vps:port`。插件会让 **playurl 和视频下载走同一个出口 IP**，签名一致，B 站 CDN 就不会只返回初始化分片。
 2. **大陆 VPS + nginx 反代**：见 `proxy-examples/nginx.conf`，部署后填 `video_proxy: https://你的域名/bili-proxy?url={url}`。
 3. **Cloudflare Worker**：见 `cloudflare-worker/worker.js`，免费、部署快；但出口 IP 通常在海外，B 站可能同样只给初始化分片。
 

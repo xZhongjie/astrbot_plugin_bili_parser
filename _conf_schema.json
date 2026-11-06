@@ -67,6 +67,19 @@
     "default": "https://images.weserv.nl/?url={host_path}&w=640&output=jpg",
     "hint": "直连 B 站图片被截断时，用第三方图片代理抓取并缩放。支持 {url} / {raw_url} / {host_path} 占位符；留空则关闭。"
   },
+  "video_proxy_api": {
+    "description": "第三方视频下载代理接口",
+    "type": "string",
+    "default": "https://dy.kukutool.com/api/download-proxy-url",
+    "hint": "直连 CDN 失败时，POST {url, sourceUrl, type} 到该接口，用返回的 url 代下视频。默认是 kukutool 的公开接口（可能失效，且会把视频地址发给第三方）；留空则关闭。"
+  },
+  "download_chunk_kb": {
+    "description": "分片下载大小（KB）",
+    "type": "int",
+    "default": 2048,
+    "slider": {"min": 0, "max": 8192, "step": 256},
+    "hint": "用 HTTP Range 分片下载视频，绕过单次连接被截断的问题；0 表示关闭，改用整包下载。"
+  },
   "video_proxy": {
     "description": "视频下载代理模板",
     "type": "string",

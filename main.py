@@ -456,14 +456,17 @@ class HttpClient:
             )
         return self._session
 
-    async def request(
+    async def request_full(
         self,
         url: str,
         *,
         headers: dict | None = None,
         timeout: float = 15,
         allow_redirects: bool = True,
-    ) -> tuple[int, bytes]:
+        method: str = "GET",
+        json_body: Any = None,
+    ) -> tuple[int, bytes, dict]:
+        """返回 (状态码, 响应体, 响应头)。"""
         session = await self._get_session()
         kwargs: dict[str, Any] = {
             "headers": headers or {},
@@ -472,9 +475,106 @@ class HttpClient:
         }
         if self.proxy:
             kwargs["proxy"] = self.proxy
-        async with session.get(url, **kwargs) as response:
+        if json_body is not None:
+            kwargs["json"] = json_body
+        async with session.request(method, url, **kwargs) as response:
             body = await response.content.read(self.max_bytes + 1)
-            return response.status, body
+            resp_headers = {k.lower(): v for k, v in response.headers.items()}
+            return response.status, body, resp_headers
+
+    async def request(
+        self,
+        url: str,
+        *,
+        headers: dict | None = None,
+        timeout: float = 15,
+        allow_redirects: bool = True,
+    ) -> tuple[int, bytes]:
+        status, body, _ = await self.request_full(
+            url, headers=headers, timeout=timeout, allow_redirects=allow_redirects
+        )
+        return status, body
+
+    async def post_json(
+        self,
+        url: str,
+        payload: Any,
+        *,
+        headers: dict | None = None,
+        timeout: float = 20,
+    ) -> tuple[int, Any]:
+        status, body, _ = await self.request_full(
+            url,
+            headers={"Content-Type": "application/json", **(headers or {})},
+            timeout=timeout,
+            method="POST",
+            json_body=payload,
+        )
+        if status != 200:
+            return status, None
+        try:
+            return status, json.loads(body.decode("utf-8", errors="replace"))
+        except Exception:
+            return status, None
+
+    async def download_range(
+        self,
+        url: str,
+        *,
+        headers: dict | None = None,
+        chunk_size: int = 2 * 1024 * 1024,
+        max_bytes: int = 0,
+        timeout: float = 180,
+    ) -> bytes | None:
+        """分片下载，绕过单次连接被截断的问题。
+
+        先请求 `bytes=0-(chunk-1)`：
+        * 返回 206 时按 Content-Range 的总长度循环取完；
+        * 返回 200 说明服务端不支持 Range，直接使用整包响应体。
+        """
+        request_headers = dict(headers or {})
+        status, first, resp_headers = await self.request_full(
+            url,
+            headers={**request_headers, "Range": f"bytes=0-{chunk_size - 1}"},
+            timeout=timeout,
+        )
+        if status == 200:
+            return first or None
+        if status != 206 or not first:
+            return None
+
+        total = 0
+        content_range = resp_headers.get("content-range") or ""
+        if "/" in content_range:
+            try:
+                total = int(content_range.rsplit("/", 1)[-1])
+            except ValueError:
+                total = 0
+
+        data = bytearray(first)
+        offset = len(first)
+        while total and offset < total:
+            if max_bytes and offset >= max_bytes:
+                return None
+            end = min(offset + chunk_size - 1, total - 1)
+            status, part, _ = await self.request_full(
+                url,
+                headers={**request_headers, "Range": f"bytes={offset}-{end}"},
+                timeout=timeout,
+            )
+            if status not in (200, 206) or not part:
+                break
+            data.extend(part)
+            offset += len(part)
+            if len(part) == 0:
+                break
+
+        if total and len(data) < total:
+            logger.warning(
+                "[bili] 分片下载不完整：期望 %d 字节，实际 %d 字节", total, len(data)
+            )
+            return None
+        return bytes(data)
 
     async def get_text(
         self, url: str, *, headers: dict | None = None, timeout: float = 15
@@ -1227,6 +1327,50 @@ class BiliParserPlugin(Star):
                 out.append(wrapped)
         return out
 
+    async def _fetch_media(
+        self, url: str, headers: dict, max_bytes: int
+    ) -> bytes | None:
+        """下载媒体：优先分片，失败再整包。"""
+        if self.http is None:
+            return None
+        chunk_kb = int(self.config.get("download_chunk_kb") or 0)
+        if chunk_kb > 0:
+            data = await self.http.download_range(
+                url,
+                headers=headers,
+                chunk_size=chunk_kb * 1024,
+                max_bytes=max_bytes,
+            )
+            if data:
+                return data
+        return await self.http.get_bytes(url, headers=headers, timeout=180)
+
+    async def _proxy_media_url(
+        self, api_url: str, video_url: str, target: BiliTarget | None
+    ) -> str:
+        """调用第三方下载代理接口，把 CDN 地址换成代理地址。"""
+        if self.http is None:
+            return ""
+        payload = {
+            "url": video_url,
+            "sourceUrl": target.canonical_url if target is not None else "",
+            "type": "video",
+        }
+        status, data = await self.http.post_json(
+            api_url,
+            payload,
+            headers={
+                "Origin": "https://dy.kukutool.com",
+                "Referer": "https://dy.kukutool.com/bilibili",
+            },
+        )
+        if status == 200 and isinstance(data, dict):
+            url = data.get("url")
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                return url
+        logger.info("[bili] 视频代理接口未返回可用地址（status=%s）", status)
+        return ""
+
     async def _download_video(
         self,
         video: BiliVideo,
@@ -1263,11 +1407,10 @@ class BiliParserPlugin(Star):
         )
         tried_durl = False
         tried_providers = False
+        tried_proxy_api = False
         while True:
             for candidate in candidates:
-                data = await self.http.get_bytes(
-                    candidate, headers=headers, timeout=180
-                )
+                data = await self._fetch_media(candidate, headers, max_bytes)
                 if not data:
                     continue
                 # 关键校验：CDN 有时会返回 200 + 错误页、JSON，或者只返回
@@ -1323,6 +1466,20 @@ class BiliParserPlugin(Star):
                         len(candidates),
                     )
                     continue
+
+            if not tried_proxy_api and target is not None:
+                tried_proxy_api = True
+                api_url = str(self.config.get("video_proxy_api") or "").strip()
+                if api_url:
+                    proxied = await self._proxy_media_url(
+                        api_url, video.video_url, target
+                    )
+                    if proxied:
+                        candidates = [proxied]
+                        logger.info(
+                            "[bili] 改用第三方下载代理重试：%s", proxied[:100]
+                        )
+                        continue
 
             break
 

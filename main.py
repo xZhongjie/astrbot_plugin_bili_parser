@@ -423,18 +423,32 @@ def extract_video(payload: Any, source: str = "") -> BiliVideo | None:
 
 
 class HttpClient:
-    """带超时、体积上限和可选代理的 aiohttp 封装。"""
+    """带超时、体积上限、可选代理和强制 IPv4 的 aiohttp 封装。"""
 
-    def __init__(self, max_bytes: int, proxy: str = "") -> None:
+    def __init__(
+        self, max_bytes: int, proxy: str = "", force_ipv4: bool = True
+    ) -> None:
         self.max_bytes = max_bytes
         self.proxy = proxy.strip()
+        self.force_ipv4 = force_ipv4
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            connector = None
+            if self.force_ipv4:
+                # 很多服务器 IPv6 出网不通：大响应会在传输中途被掐断/卡住，
+                # 表现为图片只下到 32KB、视频只下到十几 KB。强制 IPv4 可绕过。
+                try:
+                    import socket
+
+                    connector = aiohttp.TCPConnector(family=socket.AF_INET)
+                except Exception:
+                    connector = None
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=180),
                 headers={"User-Agent": BILI_HEADERS["User-Agent"]},
+                connector=connector,
             )
         return self._session
 
@@ -564,7 +578,9 @@ class BiliParserPlugin(Star):
         max_mb = int(self.config.get("max_video_mb") or 30)
         max_bytes = max(max_mb, 8) * 1024 * 1024
         self.http = HttpClient(
-            max_bytes, proxy=str(self.config.get("proxy") or "").strip()
+            max_bytes,
+            proxy=str(self.config.get("proxy") or "").strip(),
+            force_ipv4=bool(self.config.get("force_ipv4", True)),
         )
         self.providers = self._load_providers()
         self._rotate_buvid()
@@ -877,26 +893,38 @@ class BiliParserPlugin(Star):
         return text.strip()
 
     # -- 媒体 ---------------------------------------------------------------
-    async def _cover_component(self, video: BiliVideo):
-        if not video.cover or self.http is None:
-            return None
+    @staticmethod
+    def _cover_candidates(cover: str) -> list[tuple[str, dict]]:
+        """封面的多种候选地址。
 
+        B 站图片 CDN 支持 `@宽_高_裁剪` 缩略图语法。部分服务器网络会把响应
+        截断在 32KB 左右，此时请求一张更小的缩略图反而能完整拿到。
+        """
         image_headers = {
             "User-Agent": BILI_HEADERS["User-Agent"],
             "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         }
-        data = None
-        # 依次尝试：带 B站 Referer → 只带 UA → 换成 http
-        for candidate_url, headers in (
-            (video.cover, BILI_HEADERS),
-            (video.cover, image_headers),
-            (
-                video.cover.replace("https://", "http://", 1)
-                if video.cover.startswith("https://")
-                else "",
-                image_headers,
-            ),
+        base = cover.split("@", 1)[0]
+        candidates: list[tuple[str, dict]] = [
+            (cover, BILI_HEADERS),
+            (cover, image_headers),
+        ]
+        for suffix in (
+            "@480w_270h_1c.webp",
+            "@480w_270h_1c",
+            "@320w_180h_1c.jpg",
         ):
+            candidates.append((base + suffix, image_headers))
+        if cover.startswith("https://"):
+            candidates.append((cover.replace("https://", "http://", 1), image_headers))
+        return candidates
+
+    async def _cover_component(self, video: BiliVideo):
+        if not video.cover or self.http is None:
+            return None
+
+        data = None
+        for candidate_url, headers in self._cover_candidates(video.cover):
             if not candidate_url:
                 continue
             data = await self.http.get_bytes(

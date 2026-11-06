@@ -55,6 +55,12 @@
     "default": "",
     "hint": "所有解析、封面与视频下载都走该代理，例如 http://127.0.0.1:7890。"
   },
+  "force_ipv4": {
+    "description": "强制使用 IPv4",
+    "type": "bool",
+    "default": true,
+    "hint": "很多服务器 IPv6 出网不通，表现为图片只下载到 32KB、视频只下载到十几 KB。开启后会强制 IPv4；如果你的服务器只有 IPv6，请关闭。"
+  },
   "send_cover": {
     "description": "发送封面图",
     "type": "bool",

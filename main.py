@@ -1,0 +1,1150 @@
+# -*- coding: utf-8 -*-
+"""astrbot_plugin_bili_parser — B 站视频链接解析插件。
+
+设计目标：
+* 自动识别聊天里的 B 站视频链接（BV / av / b23.tv 短链 / ?p= 分 P），解析后发送图文卡片
+* 多解析源：第三方解析 API 可配置任意多个，请求时按「并行竞速」或「顺序回退」取第一个成功结果
+* 官方 API 兜底：自动生成 buvid3 Cookie + 规范 UA/Referer，遇到 412 自动换 Cookie 重试
+* 可选下载视频，下载时按 B 站 CDN 镜像 host 轮换，避免单条线路失败
+* 频率限制、同链接冷却、失败提示，尽量不给第三方接口添麻烦
+
+参考思路：koishi-plugin-bilibili-videolink-analysis（多请求模式 / 第三方解析接口）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import random
+import re
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, quote, urlparse, urlunparse
+
+import aiohttp
+
+import astrbot.api.message_components as Comp
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, StarTools
+
+try:
+    from astrbot.core.star.filter.command import GreedyStr
+except Exception:  # pragma: no cover - 兼容旧版本 AstrBot
+
+    class GreedyStr(str):
+        """旧版本回退：退化为普通字符串。"""
+
+
+PLUGIN_NAME = "astrbot_plugin_bili_parser"
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+
+DEFAULT_CARD_TEMPLATE = (
+    "【{title}】\n"
+    "UP主：{up} · 时长：{duration}\n"
+    "播放 {view} · 点赞 {like} · 投币 {coin} · 收藏 {favorite}\n"
+    "{desc}\n"
+    "{url}"
+)
+
+DEFAULT_PROVIDERS = [
+    {
+        "__template_key": "provider",
+        "name": "星之阁",
+        "type": "xingzhige",
+        "enabled": True,
+        "url_template": "https://api.xingzhige.com/API/b_parse/?url={url}",
+        "timeout": 12,
+    },
+    {
+        "__template_key": "provider",
+        "name": "B站官方",
+        "type": "official",
+        "enabled": True,
+        "url_template": "https://api.bilibili.com/x/web-interface/view?bvid={bvid}",
+        "timeout": 12,
+    },
+    {
+        "__template_key": "provider",
+        "name": "Pearktrue（备用）",
+        "type": "custom",
+        "enabled": False,
+        "url_template": "https://api.pearktrue.cn/api/bilibili/?url={url}",
+        "timeout": 12,
+    },
+    {
+        "__template_key": "provider",
+        "name": "Kxzjoker（备用）",
+        "type": "custom",
+        "enabled": False,
+        "url_template": "https://api.kxzjoker.cn/api/bilibili?url={url}",
+        "timeout": 12,
+    },
+    {
+        "__template_key": "provider",
+        "name": "Oioweb（备用）",
+        "type": "custom",
+        "enabled": False,
+        "url_template": "https://api.oioweb.cn/api/bilibili/?url={url}",
+        "timeout": 12,
+    },
+    {
+        "__template_key": "provider",
+        "name": "52vmy（备用）",
+        "type": "custom",
+        "enabled": False,
+        "url_template": "https://api.52vmy.cn/api/video/bilibili?url={url}",
+        "timeout": 12,
+    },
+]
+
+BILI_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.bilibili.com/",
+    "Accept": "application/json, text/plain, */*",
+}
+
+# B 站视频 CDN 的镜像 host，下载失败时依次替换尝试
+MIRROR_HOSTS = (
+    "upos-sz-mirrorcos.bilivideo.com",
+    "upos-sz-mirrorali.bilivideo.com",
+    "upos-sz-mirrorhw.bilivideo.com",
+    "upos-sz-mirror08c.bilivideo.com",
+    "upos-sz-mirrorbd.bilivideo.com",
+    "upos-hz-mirrorakam.akamaized.net",
+)
+
+RE_VIDEO_URL = re.compile(
+    r"https?://(?:www\.|m\.|t\.)?bilibili\.com/video/(BV[0-9A-Za-z]{10}|av\d+)",
+    re.IGNORECASE,
+)
+RE_SHORT_URL = re.compile(
+    r"https?://(?:b23\.tv|bili2233\.cn)/([0-9A-Za-z]+)", re.IGNORECASE
+)
+RE_BARE_BV = re.compile(r"\b(BV[0-9A-Za-z]{10})\b")
+RE_ANY_URL = re.compile(r"https?://[^\s<>\"']+")
+RE_PAGE = re.compile(r"[?&]p=(\d+)", re.IGNORECASE)
+RE_DURATION = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2})$")
+
+
+# ---------------------------------------------------------------------------
+# 数据模型
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BiliTarget:
+    """一条待解析的 B 站视频目标。"""
+
+    bvid: str = ""
+    aid: int = 0
+    page: int = 1
+    url: str = ""
+
+    @property
+    def key(self) -> str:
+        return f"{self.bvid or 'av' + str(self.aid)}:p{self.page}"
+
+    @property
+    def canonical_url(self) -> str:
+        if self.url:
+            return self.url
+        if self.bvid:
+            base = f"https://www.bilibili.com/video/{self.bvid}"
+        else:
+            base = f"https://www.bilibili.com/video/av{self.aid}"
+        return f"{base}?p={self.page}" if self.page > 1 else base
+
+
+@dataclass
+class BiliVideo:
+    """解析结果，字段都做了缺省处理，方便兼容各种第三方 JSON。"""
+
+    bvid: str = ""
+    aid: int = 0
+    cid: int = 0
+    title: str = ""
+    desc: str = ""
+    cover: str = ""
+    duration: int = 0
+    owner_name: str = ""
+    owner_face: str = ""
+    stat: dict = field(default_factory=dict)
+    pages: list = field(default_factory=list)
+    video_url: str = ""
+    source: str = ""
+    page: int = 1
+
+    @property
+    def page_title(self) -> str:
+        for item in self.pages:
+            try:
+                if int(item.get("page", 0)) == self.page:
+                    return str(item.get("part") or "")
+            except (TypeError, ValueError):
+                continue
+        return ""
+
+
+class ProviderError(Exception):
+    """单个解析源失败。"""
+
+
+class AllProvidersFailed(Exception):
+    """全部解析源失败。"""
+
+
+# ---------------------------------------------------------------------------
+# 通用工具
+# ---------------------------------------------------------------------------
+
+
+def to_int(value: Any) -> int:
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value).strip()
+        if not text:
+            return 0
+        if text.isdigit():
+            return int(text)
+        # "1.2万" / "3.4亿"
+        match = re.match(r"^([\d.]+)\s*([万亿wWkK]?)$", text)
+        if match:
+            number = float(match.group(1))
+            unit = match.group(2)
+            if unit in ("万", "w", "W"):
+                number *= 10000
+            elif unit == "亿":
+                number *= 100000000
+            elif unit in ("k", "K"):
+                number *= 1000
+            return int(number)
+        return 0
+    except Exception:
+        return 0
+
+
+def format_count(value: Any) -> str:
+    number = to_int(value)
+    if number <= 0:
+        return "0"
+    if number >= 100000000:
+        return f"{number / 100000000:.1f}亿"
+    if number >= 10000:
+        return f"{number / 10000:.1f}万"
+    return str(number)
+
+
+def format_duration(value: Any) -> str:
+    seconds = to_int(value)
+    if seconds <= 0:
+        match = RE_DURATION.match(str(value or "").strip())
+        if match:
+            hours = int(match.group(1) or 0)
+            seconds = hours * 3600 + int(match.group(2)) * 60 + int(match.group(3))
+    if seconds <= 0:
+        return "未知"
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def normalize_cover(url: str) -> str:
+    url = str(url or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    return url.replace("http://", "https://", 1) if url.startswith("http://") else url
+
+
+def _pick(node: dict, *paths: str, default: Any = None) -> Any:
+    """按点号路径取值，返回第一个非空值。"""
+    for path in paths:
+        current: Any = node
+        ok = True
+        for part in path.split("."):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                ok = False
+                break
+        if ok and current not in (None, "", [], {}):
+            return current
+    return default
+
+
+def _find_video_node(payload: Any) -> dict | None:
+    """在任意 JSON 里找最像「视频信息」的那个对象。"""
+    best: dict | None = None
+    best_score = -1
+    stack: list[Any] = [payload]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            score = 0
+            bvid = str(current.get("bvid") or "")
+            if bvid.startswith("BV"):
+                score += 3
+            if "aid" in current:
+                score += 1
+            if any(k in current for k in ("title", "video", "owner", "stat", "pic")):
+                score += 2
+            if score > best_score:
+                best, best_score = current, score
+            stack.extend(v for v in current.values() if isinstance(v, (dict, list)))
+        elif isinstance(current, list):
+            stack.extend(v for v in current if isinstance(v, (dict, list)))
+    return best if best_score > 0 else None
+
+
+def extract_video(payload: Any, source: str = "") -> BiliVideo | None:
+    """从第三方 / 官方 JSON 中提取视频信息。
+
+    兼容以下几种常见结构：
+    * 星之阁：{"code":0,"data":{"bvid":..,"video":{"title":..,"fm":..,"url":..},"owner":..,"stat":..}}
+    * B站官方：{"code":0,"data":{"bvid":..,"title":..,"pic":..,"owner":..,"stat":..}}
+    * 各类第三方：{"code":200,"data":{...}} / {"data":{...}} / 直接返回 {...}
+    """
+    node = _find_video_node(payload)
+    if node is None:
+        return None
+
+    bvid = str(_pick(node, "bvid", "data.bvid", default="") or "").strip()
+    aid = to_int(_pick(node, "aid", "data.aid", default=0))
+    title = str(
+        _pick(
+            node,
+            "title",
+            "video.title",
+            "data.title",
+            "data.video.title",
+            default="",
+        )
+        or ""
+    ).strip()
+    if not title:
+        return None
+    if not bvid and not aid and not _pick(node, "video.url", "url", "data.video.url"):
+        return None
+
+    stat = _pick(node, "stat", "data.stat", default={}) or {}
+    if not isinstance(stat, dict):
+        stat = {}
+
+    pages = _pick(node, "pages", "data.pages", default=[]) or []
+
+    video_url = str(
+        _pick(node, "video.url", "url", "data.video.url", "play_url", default="") or ""
+    ).strip()
+    if video_url and not video_url.startswith(("http://", "https://")):
+        video_url = ""
+
+    return BiliVideo(
+        bvid=bvid,
+        aid=aid,
+        cid=to_int(_pick(node, "cid", "data.cid", default=0)),
+        title=title,
+        desc=str(_pick(node, "desc", "video.desc", "data.desc", default="") or ""),
+        cover=normalize_cover(
+            str(
+                _pick(
+                    node,
+                    "pic",
+                    "cover",
+                    "video.fm",
+                    "video.cover",
+                    "data.pic",
+                    default="",
+                )
+                or ""
+            )
+        ),
+        duration=to_int(
+            _pick(node, "duration", "video.duration", "data.duration", default=0)
+        ),
+        owner_name=str(
+            _pick(
+                node,
+                "owner.name",
+                "author.name",
+                "author",
+                "up",
+                "uname",
+                "data.owner.name",
+                default="",
+            )
+            or ""
+        ),
+        owner_face=normalize_cover(
+            str(
+                _pick(
+                    node,
+                    "owner.face",
+                    "avatar",
+                    "data.owner.face",
+                    default="",
+                )
+                or ""
+            )
+        ),
+        stat={
+            "view": _pick(stat, "view", "play", "views", default=0),
+            "like": _pick(stat, "like", "likes", default=0),
+            "coin": _pick(stat, "coin", "coins", default=0),
+            "favorite": _pick(stat, "favorite", "favorites", "collect", default=0),
+            "danmaku": _pick(stat, "danmaku", "danmuku", default=0),
+            "share": _pick(stat, "share", "shares", default=0),
+            "reply": _pick(stat, "reply", "replies", default=0),
+        },
+        pages=[p for p in pages if isinstance(p, dict)][:50],
+        video_url=video_url,
+        source=source,
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+
+class HttpClient:
+    """带超时、体积上限和可选代理的 aiohttp 封装。"""
+
+    def __init__(self, max_bytes: int, proxy: str = "") -> None:
+        self.max_bytes = max_bytes
+        self.proxy = proxy.strip()
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=180),
+                headers={"User-Agent": BILI_HEADERS["User-Agent"]},
+            )
+        return self._session
+
+    async def request(
+        self,
+        url: str,
+        *,
+        headers: dict | None = None,
+        timeout: float = 15,
+        allow_redirects: bool = True,
+    ) -> tuple[int, bytes]:
+        session = await self._get_session()
+        kwargs: dict[str, Any] = {
+            "headers": headers or {},
+            "timeout": aiohttp.ClientTimeout(total=timeout),
+            "allow_redirects": allow_redirects,
+        }
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
+        async with session.get(url, **kwargs) as response:
+            body = await response.content.read(self.max_bytes + 1)
+            return response.status, body
+
+    async def get_text(
+        self, url: str, *, headers: dict | None = None, timeout: float = 15
+    ) -> tuple[int, str]:
+        status, body = await self.request(url, headers=headers, timeout=timeout)
+        return status, body.decode("utf-8", errors="replace")
+
+    async def get_json(
+        self, url: str, *, headers: dict | None = None, timeout: float = 15
+    ) -> tuple[int, Any]:
+        status, text = await self.get_text(url, headers=headers, timeout=timeout)
+        if status != 200:
+            return status, None
+        try:
+            return status, json.loads(text)
+        except Exception:
+            return status, None
+
+    async def get_bytes(
+        self, url: str, *, headers: dict | None = None, timeout: float = 120
+    ) -> bytes | None:
+        try:
+            status, body = await self.request(url, headers=headers, timeout=timeout)
+        except Exception as exc:
+            logger.warning("[bili] 下载失败：%s（%s）", url[:160], exc)
+            return None
+        if status != 200 or not body or len(body) > self.max_bytes:
+            return None
+        return body
+
+    async def resolve(self, url: str, *, headers: dict | None = None) -> str:
+        """跟随重定向，返回最终 URL（用于 b23.tv 短链）。"""
+        session = await self._get_session()
+        kwargs: dict[str, Any] = {
+            "headers": headers or {},
+            "timeout": aiohttp.ClientTimeout(total=15),
+            "allow_redirects": True,
+        }
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
+        async with session.get(url, **kwargs) as response:
+            return str(response.url)
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
+
+# ---------------------------------------------------------------------------
+# 插件主体
+# ---------------------------------------------------------------------------
+
+
+class BiliParserPlugin(Star):
+    """B 站视频链接解析。"""
+
+    def __init__(self, context: Context, config: AstrBotConfig) -> None:
+        super().__init__(context)
+        self.config = config
+        self.http: HttpClient | None = None
+        self.providers: list[dict] = self._load_providers()
+        self._buvid3 = ""
+        self._recent: dict[str, float] = {}
+        self._data_dir: Path | None = None
+        self._initialized = False
+
+    # -- 配置 ---------------------------------------------------------------
+    def _load_providers(self) -> list[dict]:
+        raw = self.config.get("providers")
+        if raw is None:
+            raw = DEFAULT_PROVIDERS
+        providers: list[dict] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                ptype = str(item.get("type") or "custom").strip() or "custom"
+                name = str(item.get("name") or "").strip() or ptype
+                timeout = float(item.get("timeout") or 0)
+                if timeout <= 0:
+                    timeout = float(self.config.get("timeout") or 12)
+                providers.append(
+                    {
+                        "name": name,
+                        "type": ptype,
+                        "enabled": bool(item.get("enabled", True)),
+                        "url_template": str(item.get("url_template") or "").strip(),
+                        "timeout": timeout,
+                    }
+                )
+        return providers
+
+    @staticmethod
+    def _default_template(provider_type: str) -> str:
+        if provider_type == "xingzhige":
+            return "https://api.xingzhige.com/API/b_parse/?url={url}"
+        if provider_type == "official":
+            return "https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+        return ""
+
+    # -- 生命周期 -----------------------------------------------------------
+    async def initialize(self) -> None:
+        self._data_dir = StarTools.get_data_dir(PLUGIN_NAME)
+        max_mb = int(self.config.get("max_video_mb") or 30)
+        max_bytes = max(max_mb, 8) * 1024 * 1024
+        self.http = HttpClient(
+            max_bytes, proxy=str(self.config.get("proxy") or "").strip()
+        )
+        self.providers = self._load_providers()
+        self._rotate_buvid()
+        enabled = [p["name"] for p in self.providers if p["enabled"]]
+        self._initialized = True
+        logger.info(
+            "[bili] 插件已加载：%d 个解析接口启用（%s）",
+            len(enabled),
+            "、".join(enabled) if enabled else "无",
+        )
+
+    async def terminate(self) -> None:
+        if self.http is not None:
+            await self.http.close()
+            self.http = None
+        self._initialized = False
+
+    # -- 官方 cookie --------------------------------------------------------
+    def _rotate_buvid(self) -> None:
+        self._buvid3 = str(uuid.uuid4()).upper()
+
+    def _cookie(self) -> str:
+        parts = [f"buvid3={self._buvid3}infoc", f"b_nut={int(time.time())}"]
+        extra = str(self.config.get("cookie") or "").strip()
+        if extra:
+            parts.append(extra)
+        return "; ".join(parts)
+
+    # -- 单源请求 -----------------------------------------------------------
+    def _render_template(self, template: str, target: BiliTarget) -> str:
+        values = {
+            "url": quote(target.canonical_url, safe=""),
+            "raw_url": target.canonical_url,
+            "bvid": target.bvid,
+            "aid": str(target.aid or ""),
+            "page": str(target.page),
+        }
+        try:
+            return template.format(**values)
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ProviderError(f"接口模板不合法：{exc}") from exc
+
+    async def _query_official(self, provider: dict, target: BiliTarget) -> BiliVideo:
+        template = provider["url_template"] or self._default_template("official")
+        if not target.bvid and "{bvid}" in template:
+            template = "https://api.bilibili.com/x/web-interface/view?aid={aid}"
+        url = self._render_template(template, target)
+
+        last_error = ""
+        for attempt in range(3):
+            headers = dict(BILI_HEADERS)
+            headers["Cookie"] = self._cookie()
+            status, payload = await self.http.get_json(
+                url, headers=headers, timeout=provider["timeout"]
+            )
+            if status == 412:
+                last_error = "HTTP 412（触发 B 站风控）"
+                logger.info("[bili] 官方接口返回 412，更换 buvid3 重试（第 %d 次）", attempt + 1)
+                self._rotate_buvid()
+                await asyncio.sleep(0.4 * (attempt + 1))
+                continue
+            if status != 200:
+                raise ProviderError(f"HTTP {status}")
+            if not isinstance(payload, dict):
+                raise ProviderError("返回内容不是 JSON")
+            code = payload.get("code")
+            if code not in (0, None):
+                message = payload.get("message") or payload.get("msg") or f"code={code}"
+                raise ProviderError(str(message))
+            video = extract_video(payload, source=provider["name"])
+            if video is None:
+                raise ProviderError("返回中没有视频信息")
+            data = payload.get("data") or {}
+            if not video.cid:
+                video.cid = to_int(data.get("cid"))
+            if not video.pages:
+                video.pages = [
+                    item for item in (data.get("pages") or []) if isinstance(item, dict)
+                ]
+            return video
+        raise ProviderError(last_error or "官方接口不可用")
+
+    async def _query_third_party(
+        self, provider: dict, target: BiliTarget
+    ) -> BiliVideo:
+        template = provider["url_template"] or self._default_template(
+            provider["type"]
+        )
+        if not template:
+            raise ProviderError("未配置 url_template")
+        url = self._render_template(template, target)
+        status, payload = await self.http.get_json(
+            url, headers=BILI_HEADERS, timeout=provider["timeout"]
+        )
+        if status != 200:
+            raise ProviderError(f"HTTP {status}")
+        if payload is None:
+            raise ProviderError("返回内容不是 JSON")
+        video = extract_video(payload, source=provider["name"])
+        if video is None:
+            raise ProviderError("返回中没有视频信息")
+        return video
+
+    async def _query_provider(
+        self, provider: dict, target: BiliTarget
+    ) -> BiliVideo:
+        timeout = float(provider.get("timeout") or 12)
+        if provider["type"] == "official":
+            coro = self._query_official(provider, target)
+        else:
+            coro = self._query_third_party(provider, target)
+        try:
+            video = await asyncio.wait_for(coro, timeout=timeout + 2)
+        except asyncio.TimeoutError as exc:
+            raise ProviderError(f"超时（{timeout:.0f}s）") from exc
+        if video is None:
+            raise ProviderError("没有解析结果")
+        video.page = target.page
+        return video
+
+    # -- 多源调度 -----------------------------------------------------------
+    async def fetch(self, target: BiliTarget) -> BiliVideo:
+        if self.http is None:
+            raise AllProvidersFailed("插件尚未初始化")
+        providers = [item for item in self.providers if item.get("enabled", True)]
+        if not providers:
+            raise AllProvidersFailed("没有启用的解析接口，请在插件配置里开启至少一个")
+
+        mode = str(self.config.get("request_mode") or "parallel").strip().lower()
+        if mode == "fallback":
+            errors: list[str] = []
+            for provider in providers:
+                try:
+                    video = await self._query_provider(provider, target)
+                    logger.info("[bili] %s 解析成功：%s", provider["name"], target.key)
+                    return video
+                except Exception as exc:
+                    errors.append(f"{provider['name']}：{self._brief(exc)}")
+                    logger.info(
+                        "[bili] 接口 %s 失败：%s", provider["name"], self._brief(exc)
+                    )
+            raise AllProvidersFailed("；".join(errors))
+
+        tasks: dict[asyncio.Task, dict] = {
+            asyncio.create_task(self._query_provider(provider, target)): provider
+            for provider in providers
+        }
+        errors = []
+        try:
+            while tasks:
+                done, _ = await asyncio.wait(
+                    list(tasks.keys()), return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    provider = tasks.pop(task, None)
+                    try:
+                        video = task.result()
+                    except Exception as exc:
+                        label = (provider or {}).get("name", "接口")
+                        errors.append(f"{label}：{self._brief(exc)}")
+                        logger.info(
+                            "[bili] 接口 %s 失败：%s", label, self._brief(exc)
+                        )
+                        continue
+                    logger.info(
+                        "[bili] %s 解析成功：%s", (provider or {}).get("name"), target.key
+                    )
+                    return video
+        finally:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks.keys(), return_exceptions=True)
+        raise AllProvidersFailed("；".join(errors) or "全部接口失败")
+
+    @staticmethod
+    def _brief(exc: Any) -> str:
+        text = str(exc).replace("\n", " ").strip()
+        return text[:120] or type(exc).__name__
+
+    # -- 链接解析 -----------------------------------------------------------
+    @staticmethod
+    def _clean_url(url: str) -> str:
+        return url.rstrip("，。、！!？?）)】]}>\"'`;；")
+
+    def _target_from_url(self, url: str) -> BiliTarget | None:
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return None
+        match = re.search(
+            r"/video/(BV[0-9A-Za-z]{10}|av(\d+))", parsed.path, re.IGNORECASE
+        )
+        if not match:
+            return None
+        token = match.group(1)
+        bvid = token if token.lower().startswith("bv") else ""
+        aid = int(match.group(2)) if match.group(2) else 0
+        page = 1
+        query = parse_qs(parsed.query)
+        if "p" in query:
+            page = to_int(query["p"][0]) or 1
+        page = max(1, page)
+        return BiliTarget(bvid=bvid, aid=aid, page=page, url=url)
+
+    async def resolve_short(self, url: str) -> BiliTarget | None:
+        if self.http is None:
+            return None
+        try:
+            final = await self.http.resolve(url, headers=BILI_HEADERS)
+        except Exception as exc:
+            logger.info("[bili] 短链解析失败：%s（%s）", url, self._brief(exc))
+            return None
+        target = self._target_from_url(final)
+        if target is not None:
+            return target
+        match = RE_VIDEO_URL.search(final)
+        if match:
+            return self._target_from_url(match.group(0))
+        return None
+
+    async def extract_targets(self, text: str) -> list[BiliTarget]:
+        """从一段文本里提取所有可解析的 B 站视频目标。"""
+        text = text or ""
+        targets: list[BiliTarget] = []
+        seen: set[str] = set()
+
+        for raw in RE_ANY_URL.finditer(text):
+            url = self._clean_url(raw.group(0))
+            host = (urlparse(url).hostname or "").lower()
+            target: BiliTarget | None = None
+            if host.endswith("bilibili.com") or host.endswith("bilibili.tv"):
+                target = self._target_from_url(url)
+            elif host in ("b23.tv", "bili2233.cn"):
+                target = await self.resolve_short(url)
+            if target is not None and target.key not in seen:
+                seen.add(target.key)
+                targets.append(target)
+
+        if not targets:
+            for match in RE_BARE_BV.finditer(text):
+                bvid = match.group(1)
+                target = BiliTarget(
+                    bvid=bvid, url=f"https://www.bilibili.com/video/{bvid}"
+                )
+                if target.key not in seen:
+                    seen.add(target.key)
+                    targets.append(target)
+        return targets
+
+    # -- 卡片 ---------------------------------------------------------------
+    def render_card(self, video: BiliVideo, target: BiliTarget) -> str:
+        template = str(self.config.get("template") or "").strip()
+        if not template:
+            template = DEFAULT_CARD_TEMPLATE
+
+        title = video.title
+        if target.page > 1:
+            page_title = video.page_title
+            suffix = f"（P{target.page}{' ' + page_title if page_title else ''}）"
+            if suffix not in title:
+                title = f"{title}{suffix}"
+
+        desc = re.sub(r"\s+", " ", video.desc or "").strip()
+        max_desc = int(self.config.get("desc_max_chars") or 0)
+        if max_desc > 0 and len(desc) > max_desc:
+            desc = desc[:max_desc].rstrip() + "…"
+
+        values = {
+            "title": title,
+            "up": video.owner_name or "未知",
+            "bvid": video.bvid or f"av{video.aid}",
+            "aid": str(video.aid or ""),
+            "page": str(target.page),
+            "duration": format_duration(video.duration),
+            "view": format_count(video.stat.get("view")),
+            "like": format_count(video.stat.get("like")),
+            "coin": format_count(video.stat.get("coin")),
+            "favorite": format_count(video.stat.get("favorite")),
+            "danmaku": format_count(video.stat.get("danmaku")),
+            "desc": desc,
+            "url": target.canonical_url,
+            "source": video.source or "未知",
+        }
+        try:
+            text = template.format(**values)
+        except (KeyError, IndexError, ValueError):
+            text = DEFAULT_CARD_TEMPLATE.format(**values)
+
+        lines = [line.rstrip() for line in text.splitlines()]
+        text = "\n".join(line for line in lines if line.strip())
+        return text.strip()
+
+    # -- 媒体 ---------------------------------------------------------------
+    async def _cover_component(self, video: BiliVideo):
+        if not video.cover or self.http is None:
+            return None
+        data = await self.http.get_bytes(
+            video.cover, headers=BILI_HEADERS, timeout=20
+        )
+        if data:
+            return Comp.Image.fromBase64(base64.b64encode(data).decode())
+        return Comp.Image.fromURL(video.cover)
+
+    @staticmethod
+    def _candidate_video_urls(url: str):
+        yield url
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+        except Exception:
+            return
+        if "bilivideo.com" not in host and "akamaized.net" not in host:
+            return
+        for mirror in MIRROR_HOSTS:
+            if mirror == host:
+                continue
+            yield urlunparse(parsed._replace(netloc=mirror))
+
+    async def _fill_play_url(self, video: BiliVideo) -> None:
+        """官方接口只给信息不给直链，下载视频前再取一次 playurl。"""
+        if self.http is None or video.video_url:
+            return
+        if not video.cid:
+            for item in video.pages:
+                try:
+                    if int(item.get("page", 0)) == video.page:
+                        video.cid = to_int(item.get("cid"))
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if not video.cid and video.pages:
+                video.cid = to_int(video.pages[0].get("cid"))
+        if not (video.bvid or video.aid):
+            return
+        qn = int(self.config.get("video_quality") or 64)
+        if video.bvid:
+            url = (
+                "https://api.bilibili.com/x/player/playurl"
+                f"?bvid={video.bvid}&cid={video.cid}&qn={qn}&fnval=16&fourk=1"
+            )
+        else:
+            url = (
+                "https://api.bilibili.com/x/player/playurl"
+                f"?avid={video.aid}&cid={video.cid}&qn={qn}&fnval=16&fourk=1"
+            )
+        headers = dict(BILI_HEADERS)
+        headers["Cookie"] = self._cookie()
+        status, payload = await self.http.get_json(url, headers=headers, timeout=15)
+        if status != 200 or not isinstance(payload, dict):
+            return
+        data = payload.get("data") or {}
+        dash = data.get("dash") or {}
+        videos = dash.get("video") or []
+        if videos:
+            first = videos[0] or {}
+            video.video_url = str(
+                first.get("baseUrl") or first.get("base_url") or ""
+            ).strip()
+        if not video.video_url:
+            durl = data.get("durl") or []
+            if durl:
+                video.video_url = str(durl[0].get("url") or "").strip()
+        if video.video_url:
+            logger.info("[bili] 已获取视频直链（qn=%s）", qn)
+
+    async def _download_video(self, video: BiliVideo) -> str | None:
+        if self.http is None or self._data_dir is None:
+            return None
+        await self._fill_play_url(video)
+        if not video.video_url:
+            logger.info("[bili] 没有可用的视频直链，跳过视频下载")
+            return None
+
+        max_mb = int(self.config.get("max_video_mb") or 0)
+        max_bytes = max_mb * 1024 * 1024 if max_mb > 0 else 0
+        headers = dict(BILI_HEADERS)
+        headers["Accept"] = "video/*,*/*;q=0.8"
+        for candidate in self._candidate_video_urls(video.video_url):
+            data = await self.http.get_bytes(candidate, headers=headers, timeout=180)
+            if not data:
+                continue
+            if max_bytes and len(data) > max_bytes:
+                logger.info(
+                    "[bili] 视频 %.1fMB 超过 %dMB 上限，跳过",
+                    len(data) / 1024 / 1024,
+                    max_mb,
+                )
+                return None
+            path = self._data_dir / (
+                f"bili_{int(time.time())}_{random.randint(1000, 9999)}.mp4"
+            )
+            await asyncio.to_thread(path.write_bytes, data)
+            logger.info("[bili] 视频已下载：%.1fMB", len(data) / 1024 / 1024)
+            return str(path)
+        return None
+
+    async def build_chain(
+        self, video: BiliVideo, target: BiliTarget, *, allow_video: bool = True
+    ) -> tuple[list[Any], str | None]:
+        chain: list[Any] = []
+        if bool(self.config.get("send_cover", True)):
+            cover = await self._cover_component(video)
+            if cover is not None:
+                chain.append(cover)
+
+        text = self.render_card(video, target)
+        if text:
+            chain.append(Comp.Plain(text))
+
+        temp_path: str | None = None
+        if allow_video and self.config.get("send_video"):
+            temp_path = await self._download_video(video)
+            if temp_path:
+                chain.append(Comp.Video.fromFileSystem(temp_path))
+        return chain, temp_path
+
+    # -- 事件 ---------------------------------------------------------------
+    def _cooldown_hit(self, event: AstrMessageEvent, target: BiliTarget) -> bool:
+        cooldown = int(self.config.get("cooldown_seconds") or 0)
+        if cooldown <= 0:
+            return False
+        try:
+            session_id = str(event.message_obj.session_id or "")
+        except Exception:
+            session_id = ""
+        key = f"{event.get_platform_id()}:{session_id}:{target.key}"
+        now = time.time()
+        for old_key, stamp in list(self._recent.items()):
+            if now - stamp > max(cooldown, 3600):
+                self._recent.pop(old_key, None)
+        last = self._recent.get(key)
+        if last is not None and now - last < cooldown:
+            return True
+        self._recent[key] = now
+        return False
+
+    @staticmethod
+    def _is_bili_command(text: str) -> bool:
+        text = (text or "").strip()
+        names = ("bili", "bili_status", "b站解析", "哔哩哔哩解析")
+        for name in names:
+            for candidate in (name, f"/{name}"):
+                if text == candidate or text.startswith(f"{candidate} "):
+                    return True
+        return False
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_any_message(self, event: AstrMessageEvent):
+        try:
+            async for result in self._handle_auto(event):
+                yield result
+        except Exception:
+            logger.exception("[bili] 自动解析失败")
+
+    async def _handle_auto(self, event: AstrMessageEvent):
+        if not self._initialized or self.http is None:
+            return
+        if not self.config.get("enabled", True):
+            return
+        if not self.config.get("auto_parse", True):
+            return
+        text = event.message_str or ""
+        if not text or self._is_bili_command(text):
+            return
+        if str(event.get_sender_id()) == str(event.message_obj.self_id):
+            return
+
+        group = getattr(event.message_obj, "group", None)
+        if (
+            self.config.get("only_when_at")
+            and group is not None
+            and not getattr(event, "is_at_or_wake_command", False)
+        ):
+            return
+
+        targets = await self.extract_targets(text)
+        if not targets:
+            return
+        if self.config.get("suppress_llm", True):
+            try:
+                event.should_call_llm(False)
+            except Exception:
+                pass
+
+        limit = max(1, int(self.config.get("max_links_per_message") or 3))
+        for target in targets[:limit]:
+            if self._cooldown_hit(event, target):
+                logger.info("[bili] 同链接仍在冷却期，跳过：%s", target.key)
+                continue
+            try:
+                video = await self.fetch(target)
+            except AllProvidersFailed as exc:
+                logger.warning("[bili] 解析失败：%s", self._brief(exc))
+                if self.config.get("show_error"):
+                    yield event.plain_result(f"B站解析失败：{self._brief(exc)}")
+                continue
+            except Exception:
+                logger.exception("[bili] 解析异常")
+                continue
+            chain, temp = await self.build_chain(video, target)
+            try:
+                yield event.chain_result(chain)
+            finally:
+                if temp:
+                    Path(temp).unlink(missing_ok=True)
+
+    @filter.command("bili", alias={"b站解析", "哔哩哔哩解析"})
+    async def bili(self, event: AstrMessageEvent, args: GreedyStr):
+        """解析 B 站视频链接或 BV 号。"""
+        if not self._initialized or self.http is None:
+            yield event.plain_result("插件尚未初始化完成，请稍后再试。")
+            return
+        text = str(args or "").strip()
+        if not text:
+            yield event.plain_result(self._help_text())
+            return
+
+        targets = await self.extract_targets(text)
+        if not targets:
+            yield event.plain_result(
+                "没有识别到 B 站视频链接。\n"
+                "支持：bilibili.com/video/BV...、av...、b23.tv 短链、单独 BV 号。"
+            )
+            return
+
+        limit = max(1, int(self.config.get("max_links_per_message") or 3))
+        for target in targets[:limit]:
+            try:
+                video = await self.fetch(target)
+            except AllProvidersFailed as exc:
+                yield event.plain_result(f"B站解析失败：{self._brief(exc)}")
+                continue
+            chain, temp = await self.build_chain(video, target)
+            try:
+                yield event.chain_result(chain)
+            finally:
+                if temp:
+                    Path(temp).unlink(missing_ok=True)
+
+    @filter.command("bili_status")
+    async def bili_status(self, event: AstrMessageEvent):
+        """查看 B 站解析接口状态。"""
+        lines = [f"B站解析：{'开启' if self.config.get('enabled', True) else '关闭'}"]
+        lines.append(
+            f"自动解析：{'开启' if self.config.get('auto_parse', True) else '关闭'}"
+        )
+        lines.append(f"请求模式：{self.config.get('request_mode') or 'parallel'}")
+        lines.append(f"链接冷却：{int(self.config.get('cooldown_seconds') or 0)} 秒")
+        lines.append(f"已记录链接：{len(self._recent)} 条")
+        lines.append("解析接口：")
+        for index, provider in enumerate(self.providers, start=1):
+            state = "✅" if provider.get("enabled", True) else "⏸"
+            template = provider.get("url_template") or self._default_template(
+                provider["type"]
+            )
+            host = ""
+            if template:
+                try:
+                    host = urlparse(template).hostname or ""
+                except Exception:
+                    host = ""
+            lines.append(
+                f"{index}. {state} {provider['name']}（{provider['type']}）{host}"
+            )
+        if not self.providers:
+            lines.append("（没有配置任何接口）")
+        return event.plain_result("\n".join(lines))
+
+    @staticmethod
+    def _help_text() -> str:
+        return (
+            "B站视频解析\n"
+            "自动识别聊天里的 B 站链接并发送图文卡片；也可以用指令手动解析。\n\n"
+            "指令：\n"
+            "/bili <链接或 BV 号> — 手动解析\n"
+            "/bili_status — 查看解析接口状态\n\n"
+            "支持：bilibili.com/video/BV...、av...、b23.tv 短链、?p= 分P、单独 BV 号。\n"
+            "解析接口可在 WebUI 插件配置里增删，支持并行竞速与顺序回退。"
+        )
+
+
+

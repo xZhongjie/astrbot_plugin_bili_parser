@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 运行数据
+data/
+*.db
+*.log
+video_cache/
+*.mp4
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

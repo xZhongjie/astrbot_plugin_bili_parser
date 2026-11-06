@@ -1,0 +1,205 @@
+{
+  "enabled": {
+    "description": "插件总开关",
+    "type": "bool",
+    "default": true
+  },
+  "auto_parse": {
+    "description": "自动解析聊天里的 B 站链接",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后只能用 /bili 指令手动解析。"
+  },
+  "only_when_at": {
+    "description": "仅在被 @ 或唤醒时自动解析",
+    "type": "bool",
+    "default": false,
+    "hint": "群里链接太多时可以打开，避免刷屏打扰。"
+  },
+  "suppress_llm": {
+    "description": "解析时阻止 AI 回复",
+    "type": "bool",
+    "default": true,
+    "hint": "避免同一条消息既发卡片又被默认 LLM 回复。"
+  },
+  "show_error": {
+    "description": "解析失败时提示",
+    "type": "bool",
+    "default": false,
+    "hint": "失败原因可能包含第三方接口地址，默认不打扰。"
+  },
+  "request_mode": {
+    "description": "多接口请求模式",
+    "type": "string",
+    "default": "parallel",
+    "options": ["parallel", "fallback"],
+    "labels": ["并行竞速（推荐）", "顺序回退"],
+    "hint": "并行：同时请求所有启用接口，取最先解析成功的结果；顺序：按列表顺序逐个尝试。"
+  },
+  "timeout": {
+    "description": "单接口超时（秒）",
+    "type": "int",
+    "default": 12,
+    "slider": {"min": 3, "max": 60, "step": 1}
+  },
+  "cookie": {
+    "description": "B站 Cookie（可选）",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "填写 SESSDATA=xxx 可提高官方接口成功率；buvid3 会由插件自动生成并在 412 时轮换。"
+  },
+  "proxy": {
+    "description": "请求代理（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "所有解析、封面与视频下载都走该代理，例如 http://127.0.0.1:7890。"
+  },
+  "send_cover": {
+    "description": "发送封面图",
+    "type": "bool",
+    "default": true,
+    "hint": "会先下载封面再以图片发送，避免部分平台防盗链。"
+  },
+  "send_video": {
+    "description": "下载并发送视频",
+    "type": "bool",
+    "default": false,
+    "hint": "需要协议端支持视频消息，会消耗带宽与磁盘；只建议小群低频使用。"
+  },
+  "max_video_mb": {
+    "description": "视频大小上限（MB）",
+    "type": "int",
+    "default": 30,
+    "slider": {"min": 0, "max": 200, "step": 5},
+    "hint": "0 表示不限制。"
+  },
+  "video_quality": {
+    "description": "视频清晰度",
+    "type": "string",
+    "default": "64",
+    "options": ["32", "64", "80"],
+    "labels": ["360P", "720P", "1080P"],
+    "hint": "未登录时高清晰度可能拿不到，插件会自动回退到可用的流。"
+  },
+  "template": {
+    "description": "卡片文本模板",
+    "type": "text",
+    "default": "【{title}】\nUP主：{up} · 时长：{duration}\n播放 {view} · 点赞 {like} · 投币 {coin} · 收藏 {favorite}\n{desc}\n{url}",
+    "hint": "可用变量：{title} {up} {bvid} {aid} {page} {duration} {view} {like} {coin} {favorite} {danmaku} {desc} {url} {source}。"
+  },
+  "desc_max_chars": {
+    "description": "简介最大字符数",
+    "type": "int",
+    "default": 80,
+    "slider": {"min": 0, "max": 500, "step": 10},
+    "hint": "0 表示不限制；超出会截断并加省略号。"
+  },
+  "cooldown_seconds": {
+    "description": "同链接冷却时间（秒）",
+    "type": "int",
+    "default": 60,
+    "slider": {"min": 0, "max": 3600, "step": 10},
+    "hint": "同一会话内相同视频在该时间内只解析一次，避免刷屏和浪费接口额度。"
+  },
+  "max_links_per_message": {
+    "description": "单条消息最多解析链接数",
+    "type": "int",
+    "default": 3,
+    "slider": {"min": 1, "max": 10, "step": 1}
+  },
+  "providers": {
+    "description": "解析接口列表",
+    "type": "template_list",
+    "default": [
+      {
+        "__template_key": "provider",
+        "name": "星之阁",
+        "type": "xingzhige",
+        "enabled": true,
+        "url_template": "https://api.xingzhige.com/API/b_parse/?url={url}",
+        "timeout": 12
+      },
+      {
+        "__template_key": "provider",
+        "name": "B站官方",
+        "type": "official",
+        "enabled": true,
+        "url_template": "https://api.bilibili.com/x/web-interface/view?bvid={bvid}",
+        "timeout": 12
+      },
+      {
+        "__template_key": "provider",
+        "name": "Pearktrue（备用）",
+        "type": "custom",
+        "enabled": false,
+        "url_template": "https://api.pearktrue.cn/api/bilibili/?url={url}",
+        "timeout": 12
+      },
+      {
+        "__template_key": "provider",
+        "name": "Kxzjoker（备用）",
+        "type": "custom",
+        "enabled": false,
+        "url_template": "https://api.kxzjoker.cn/api/bilibili?url={url}",
+        "timeout": 12
+      },
+      {
+        "__template_key": "provider",
+        "name": "Oioweb（备用）",
+        "type": "custom",
+        "enabled": false,
+        "url_template": "https://api.oioweb.cn/api/bilibili/?url={url}",
+        "timeout": 12
+      },
+      {
+        "__template_key": "provider",
+        "name": "52vmy（备用）",
+        "type": "custom",
+        "enabled": false,
+        "url_template": "https://api.52vmy.cn/api/video/bilibili?url={url}",
+        "timeout": 12
+      }
+    ],
+    "hint": "可以添加任意第三方解析接口。{url} 为经过 URL 编码的视频地址，{raw_url} 为原始地址，另有 {bvid} {aid} {page} 可用。",
+    "templates": {
+      "provider": {
+        "name": "解析接口",
+        "hint": "第三方免费接口经常失效，失败不影响其它接口",
+        "display_item": "name",
+        "items": {
+          "name": {
+            "description": "接口名称",
+            "type": "string",
+            "default": "自定义接口"
+          },
+          "type": {
+            "description": "接口类型",
+            "type": "string",
+            "default": "custom",
+            "options": ["xingzhige", "official", "custom"],
+            "labels": ["星之阁（第三方）", "B站官方 API", "自定义 JSON 接口"],
+            "hint": "official 会自动处理 412 与 buvid3；custom/xingzhige 走通用 JSON 解析。"
+          },
+          "enabled": {
+            "description": "启用",
+            "type": "bool",
+            "default": true
+          },
+          "url_template": {
+            "description": "请求地址模板",
+            "type": "string",
+            "default": "",
+            "hint": "例如 https://api.example.com/bili?url={url}"
+          },
+          "timeout": {
+            "description": "超时（秒）",
+            "type": "int",
+            "default": 12,
+            "slider": {"min": 3, "max": 60, "step": 1}
+          }
+        }
+      }
+    }
+  }
+}

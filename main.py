@@ -902,8 +902,19 @@ class BiliParserPlugin(Star):
             data = await self.http.get_bytes(
                 candidate_url, headers=headers, timeout=20
             )
-            if data:
-                break
+            if not data:
+                continue
+            # 连接被提前关闭时可能只拿到半张图，PIL 会容忍截断的 JPEG 并把
+            # 缺失部分填灰。这里先做字节级完整性校验。
+            if not self._is_complete_image(data):
+                logger.warning(
+                    "[bili] 封面数据不完整（%d 字节），换方式重试：%s",
+                    len(data),
+                    candidate_url[:120],
+                )
+                data = None
+                continue
+            break
         if not data:
             logger.warning("[bili] 封面下载失败，跳过封面：%s", video.cover[:120])
             return None
@@ -928,6 +939,25 @@ class BiliParserPlugin(Star):
         return Comp.Image.fromBase64(base64.b64encode(normalized).decode())
 
     @staticmethod
+    def _is_complete_image(data: bytes) -> bool:
+        """粗略判断图片字节是否完整（防止半张灰图）。"""
+        if len(data) < 128:
+            return False
+        if data[:2] == b"\xff\xd8":  # JPEG
+            return data.rstrip(b"\x00").endswith(b"\xff\xd9")
+        if data[:8] == b"\x89PNG\r\n\x1a\n":  # PNG
+            return b"IEND" in data[-64:]
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":  # WebP
+            try:
+                size = int.from_bytes(data[4:8], "little") + 8
+            except Exception:
+                return False
+            return len(data) >= size
+        if data[:6] in (b"GIF87a", b"GIF89a"):  # GIF
+            return data.rstrip(b"\x00").endswith(b"\x3b")
+        return True
+
+    @staticmethod
     def _normalize_cover(data: bytes) -> bytes | None:
         try:
             import io
@@ -941,6 +971,8 @@ class BiliParserPlugin(Star):
                     image.mode,
                     image.size,
                 )
+                # 强制完整解码；截断文件会在这里抛异常，而不是生成灰图
+                image.load()
                 image = image.convert("RGB")
                 max_width, max_height = 1280, 4000
                 if image.width > max_width or image.height > max_height:
@@ -1001,12 +1033,14 @@ class BiliParserPlugin(Star):
         if video.bvid:
             url = (
                 "https://api.bilibili.com/x/player/playurl"
-                f"?bvid={video.bvid}&cid={video.cid}&qn={qn}&fnval={fnval}&fourk=1"
+                f"?bvid={video.bvid}&cid={video.cid}&qn={qn}&fnval={fnval}"
+                "&fourk=1&platform=html5&high_quality=1"
             )
         else:
             url = (
                 "https://api.bilibili.com/x/player/playurl"
-                f"?avid={video.aid}&cid={video.cid}&qn={qn}&fnval={fnval}&fourk=1"
+                f"?avid={video.aid}&cid={video.cid}&qn={qn}&fnval={fnval}"
+                "&fourk=1&platform=html5&high_quality=1"
             )
         headers = dict(BILI_HEADERS)
         headers["Cookie"] = self._cookie()
@@ -1029,9 +1063,16 @@ class BiliParserPlugin(Star):
             return str(first.get("baseUrl") or first.get("base_url") or "").strip()
         return ""
 
-    async def _fill_play_url(self, video: BiliVideo, qn: int | None = None) -> None:
+    async def _fill_play_url(
+        self,
+        video: BiliVideo,
+        qn: int | None = None,
+        force: bool = False,
+    ) -> None:
         """官方接口只给信息不给直链，下载视频前再取一次 playurl。"""
-        if self.http is None or video.video_url:
+        if self.http is None:
+            return
+        if video.video_url and not force:
             return
         self._ensure_cid(video)
         if not (video.bvid or video.aid):
@@ -1112,9 +1153,18 @@ class BiliParserPlugin(Star):
     ) -> str | None:
         if self.http is None or self._data_dir is None:
             return None
-        if qn_override:
+
+        # 第三方接口给的直链通常把签名绑定在第三方服务器 IP 上，从我们这边
+        # 下载往往只能拿到初始化分片。所以只要知道 bvid / aid，就优先用
+        # 自己请求 playurl 得到的、签名绑定本机 IP 的直链。
+        provider_url = video.video_url
+        if (video.bvid or video.aid) and not qn_override:
             video = replace(video, video_url="")
-        await self._fill_play_url(video, qn_override)
+            await self._fill_play_url(video, force=True)
+            if not video.video_url and provider_url:
+                video = replace(video, video_url=provider_url)
+        else:
+            await self._fill_play_url(video, qn_override)
         if not video.video_url:
             logger.info("[bili] 没有可用的视频直链，跳过视频下载")
             return None
@@ -1123,6 +1173,8 @@ class BiliParserPlugin(Star):
         max_bytes = max_mb * 1024 * 1024 if max_mb > 0 else 0
         headers = dict(BILI_HEADERS)
         headers["Accept"] = "video/*,*/*;q=0.8"
+        if video.bvid:
+            headers["Referer"] = f"https://www.bilibili.com/video/{video.bvid}"
 
         candidates = list(self._candidate_video_urls(video.video_url))
         tried_durl = False
@@ -1137,7 +1189,7 @@ class BiliParserPlugin(Star):
                 # 关键校验：CDN 有时会返回 200 + 错误页、JSON，或者只返回
                 # 几百字节的 DASH 初始化分片。直接发出去就是「1 秒黑屏」，
                 # 所以必须确认是真正的、足够大的 MP4。
-                if len(data) < 32 * 1024 or not self._looks_like_mp4(data):
+                if len(data) < 64 * 1024 or not self._looks_like_mp4(data):
                     logger.warning(
                         "[bili] 视频地址返回的不是完整 MP4（%d 字节，文件头 %s），"
                         "可能被 CDN 拦截或只返回了初始化分片，尝试下一个地址：%s",

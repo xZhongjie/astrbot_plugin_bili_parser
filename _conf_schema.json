@@ -87,7 +87,7 @@
     "default": "auto",
     "options": ["auto", "base64", "file"],
     "labels": ["自动（推荐）", "Base64", "本地路径"],
-    "hint": "自动：配置了 callback_api_base 就用本地路径（AstrBot 会转成 HTTP 链接）；否则小视频用 base64，大视频用本地路径。"
+    "hint": "自动：先按本地路径发送（配置 callback_api_base 时 AstrBot 会转成 HTTP 链接）；路径发送失败且文件不超过上限时才退回 base64。几十 MB 的视频走 base64 容易被截断，表现为只有 1 秒且全黑。"
   },
   "video_quality": {
     "description": "视频清晰度",

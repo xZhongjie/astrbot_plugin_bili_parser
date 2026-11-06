@@ -180,9 +180,10 @@ https://your-parse-api.example.com/bili?url={url}
 - 视频下载会占用内存与磁盘，默认关闭；大群建议保持关闭
 - **视频会作为单独一条消息发送**：QQ / OneBot 要求 `video` 段不能与文字、图片混在同一条消息里（否则报 `retcode 1400: message element "video" must be the only segment`）
 - **视频发送方式**（`video_send_mode`）：
-  - `auto`（默认）：配置了 AstrBot 的 `callback_api_base` 时用本地路径（AstrBot 自动转 HTTP 链接）；没配置时，不超过 `video_base64_max_mb` 的视频转成 `base64://` 发送，完全绕开协议端的文件系统
-  - `base64`：强制 base64，适合协议端在另一个容器 / 机器
+  - `auto`（默认）：**先按本地路径发送**（配置了 AstrBot 的 `callback_api_base` 时，AstrBot 会自动把文件转成 HTTP 链接）；只有路径发送真的报错，才在文件不超过 `video_base64_max_mb` 时退回 `base64://`
+  - `base64`：强制 base64。注意几十 MB 的视频转 base64 后可能被协议端截断，表现为「1 秒且全黑」，只建议小文件使用
   - `file`：强制本地路径，适合 AstrBot 与协议端共享文件系统
+- 本地路径发送失败且文件超过 base64 上限时，插件会发一条文字提示，而不是悄悄发一个坏视频
 - 视频文件会在发送后延迟 10 分钟清理，启动时也会清理一天前的缓存，不会一直占磁盘
 - 解析失败时默认静默（`show_error` 可打开），日志里仍有详细记录
 

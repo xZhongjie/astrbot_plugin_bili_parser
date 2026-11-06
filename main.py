@@ -899,6 +899,12 @@ class BiliParserPlugin(Star):
             from PIL import Image as PILImage
 
             with PILImage.open(io.BytesIO(data)) as image:
+                logger.debug(
+                    "[bili] 封面原图：%s %s %s",
+                    image.format,
+                    image.mode,
+                    image.size,
+                )
                 image = image.convert("RGB")
                 max_width, max_height = 1280, 4000
                 if image.width > max_width or image.height > max_height:
@@ -1033,59 +1039,84 @@ class BiliParserPlugin(Star):
                 self._schedule_cleanup(temp_path, delay=600)
         return chain, temp_path
 
-    # -- 视频发送方式 -------------------------------------------------------
-    def _callback_api_configured(self) -> bool:
+    # -- 发送 ---------------------------------------------------------------
+    async def _send_chain(self, event: AstrMessageEvent, chain: list[Any]) -> bool:
+        """直接发送消息链，并把底层协议错误暴露出来，便于降级处理。"""
+        if not chain:
+            return True
         try:
-            config = self.context.get_config()
-            return bool(str(config.get("callback_api_base") or "").strip())
-        except Exception:
+            await event.send(MessageChain(chain))
+            return True
+        except Exception as exc:
+            logger.warning("[bili] 发送消息失败：%s", self._brief(exc))
             return False
 
-    async def _video_chain(self, temp_path: str) -> list[Any]:
-        """视频必须单独成条发送。
+    async def _send_plain(self, event: AstrMessageEvent, text: str) -> bool:
+        return await self._send_chain(event, [Comp.Plain(text)])
 
-        OneBot / QQ（NapCat 等）要求 message 里 video 段不能和其它段混发，
-        否则会返回 retcode 1400：message element "video" must be the only segment。
+    async def _send_video(self, event: AstrMessageEvent, temp_path: str) -> None:
+        """发送视频：本地路径优先，失败再退回 base64。
 
-        发送方式：
-        * 配置了 AstrBot 的 callback_api_base 时用本地路径——AstrBot 会自动
-          把文件注册成 HTTP 链接，适合协议端在另一个容器 / 机器的情况；
-        * 否则把视频转成 base64:// 发送（小文件），不依赖协议端能否访问
-          本机文件系统；
-        * 超过 base64 上限时退回本地路径，并在日志里提示。
+        QQ / OneBot 要求 video 段单独成条；且把几十 MB 的视频塞进 base64
+        再走 WebSocket，容易被协议端截断，表现为「只有 1 秒且全黑」。
+        所以默认先发本地路径（AstrBot 在配置 callback_api_base 时会自动
+        转成 HTTP 链接），只有路径发送真的报错时才退回 base64。
         """
         mode = str(self.config.get("video_send_mode") or "auto").strip().lower()
         try:
             size = Path(temp_path).stat().st_size
         except OSError:
             size = 0
-        max_b64_mb = int(self.config.get("video_base64_max_mb") or 20)
+        max_b64_raw = self.config.get("video_base64_max_mb")
+        if max_b64_raw is None or str(max_b64_raw).strip() == "":
+            max_b64_mb = 20
+        else:
+            try:
+                max_b64_mb = max(0, int(max_b64_raw))
+            except (TypeError, ValueError):
+                max_b64_mb = 20
         max_b64 = max_b64_mb * 1024 * 1024
 
-        use_base64 = False
-        if mode == "base64":
-            use_base64 = True
-        elif mode == "auto":
-            if self._callback_api_configured():
-                use_base64 = False
-            elif size <= max_b64:
-                use_base64 = True
+        if mode in ("auto", "file"):
+            if await self._send_chain(
+                event, [Comp.Video(file=temp_path, path=temp_path)]
+            ):
+                return
+            logger.warning("[bili] 本地路径发送视频失败，尝试 base64 兜底")
 
-        if use_base64:
-            data = await asyncio.to_thread(Path(temp_path).read_bytes)
-            logger.info(
-                "[bili] 视频以 base64 发送（%.1fMB）", len(data) / 1024 / 1024
-            )
-            return [Comp.Video(file="base64://" + base64.b64encode(data).decode())]
+        if mode in ("auto", "base64"):
+            if size and size > max_b64:
+                logger.warning(
+                    "[bili] 视频 %.1fMB 超过 base64 上限 %dMB，不再尝试 base64；"
+                    "请配置 callback_api_base 让视频走 HTTP 链接",
+                    size / 1024 / 1024,
+                    max_b64_mb,
+                )
+            else:
+                try:
+                    data = await asyncio.to_thread(Path(temp_path).read_bytes)
+                    logger.info(
+                        "[bili] 视频改用 base64 发送（%.1fMB）",
+                        len(data) / 1024 / 1024,
+                    )
+                    if await self._send_chain(
+                        event,
+                        [
+                            Comp.Video(
+                                file="base64://" + base64.b64encode(data).decode()
+                            )
+                        ],
+                    ):
+                        return
+                except Exception as exc:
+                    logger.warning("[bili] base64 发送视频失败：%s", self._brief(exc))
 
-        if size > max_b64 and mode == "auto":
-            logger.warning(
-                "[bili] 视频 %.1fMB 超过 base64 上限且未配置 callback_api_base，"
-                "改为本地路径发送；若协议端与 AstrBot 不共享文件系统会失败，"
-                "请配置 callback_api_base 或调大 video_base64_max_mb",
-                size / 1024 / 1024,
-            )
-        return [Comp.Video(file=temp_path, path=temp_path)]
+        await self._send_plain(
+            event,
+            "视频发送失败：协议端无法读取视频文件。"
+            "请在 AstrBot 配置里设置 callback_api_base，"
+            "或把视频发送方式改成 base64 并调大 video_base64_max_mb。",
+        )
 
     def _schedule_cleanup(self, path: str, delay: float = 600) -> None:
         """延迟删除临时文件，给协议端留出读取时间。"""
@@ -1135,8 +1166,7 @@ class BiliParserPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_any_message(self, event: AstrMessageEvent):
         try:
-            async for result in self._handle_auto(event):
-                yield result
+            await self._handle_auto(event)
         except Exception:
             logger.exception("[bili] 自动解析失败")
 
@@ -1180,33 +1210,38 @@ class BiliParserPlugin(Star):
             except AllProvidersFailed as exc:
                 logger.warning("[bili] 解析失败：%s", self._brief(exc))
                 if self.config.get("show_error"):
-                    yield event.plain_result(f"B站解析失败：{self._brief(exc)}")
+                    await self._send_plain(
+                        event, f"B站解析失败：{self._brief(exc)}"
+                    )
                 continue
             except Exception:
                 logger.exception("[bili] 解析异常")
                 continue
             chain, temp = await self.build_chain(video, target)
-            yield event.chain_result(chain)
+            if not await self._send_chain(event, chain):
+                # 图片发送失败时降级为纯文本卡片，至少把信息发出去
+                await self._send_plain(event, self.render_card(video, target))
             if temp:
                 # QQ 要求 video 段单独成条，不能和卡片混发
-                yield event.chain_result(await self._video_chain(temp))
+                await self._send_video(event, temp)
 
     @filter.command("bili", alias={"b站解析", "哔哩哔哩解析"})
     async def bili(self, event: AstrMessageEvent, args: GreedyStr):
         """解析 B 站视频链接或 BV 号。"""
         if not self._initialized or self.http is None:
-            yield event.plain_result("插件尚未初始化完成，请稍后再试。")
+            await self._send_plain(event, "插件尚未初始化完成，请稍后再试。")
             return
         text = str(args or "").strip()
         if not text:
-            yield event.plain_result(self._help_text())
+            await self._send_plain(event, self._help_text())
             return
 
         targets = await self.extract_targets(text)
         if not targets:
-            yield event.plain_result(
+            await self._send_plain(
+                event,
                 "没有识别到 B 站视频链接。\n"
-                "支持：bilibili.com/video/BV...、av...、b23.tv 短链、单独 BV 号。"
+                "支持：bilibili.com/video/BV...、av...、b23.tv 短链、单独 BV 号。",
             )
             return
 
@@ -1215,12 +1250,13 @@ class BiliParserPlugin(Star):
             try:
                 video = await self.fetch(target)
             except AllProvidersFailed as exc:
-                yield event.plain_result(f"B站解析失败：{self._brief(exc)}")
+                await self._send_plain(event, f"B站解析失败：{self._brief(exc)}")
                 continue
             chain, temp = await self.build_chain(video, target)
-            yield event.chain_result(chain)
+            if not await self._send_chain(event, chain):
+                await self._send_plain(event, self.render_card(video, target))
             if temp:
-                yield event.chain_result(await self._video_chain(temp))
+                await self._send_video(event, temp)
 
     @filter.command("bili_status")
     async def bili_status(self, event: AstrMessageEvent):

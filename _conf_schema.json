@@ -79,7 +79,7 @@
     "type": "int",
     "default": 20,
     "slider": {"min": 1, "max": 100, "step": 1},
-    "hint": "视频不超过这个大小且未配置 callback_api_base 时，会转成 base64 发送，避免协议端找不到文件。"
+    "hint": "视频不超过这个大小且未配置 callback_api_base 时，会转成 base64 发送；超过时会自动降低清晰度重试一次，仍超限才放弃。"
   },
   "video_send_mode": {
     "description": "视频发送方式",

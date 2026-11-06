@@ -84,6 +84,9 @@ git clone https://github.com/xZhongjie/astrbot_plugin_bili_parser.git
 | `force_ipv4` | `true` | 强制 IPv4，避免 IPv6 出网导致大文件被截断 |
 | `cover_proxy` | weserv 图片代理 | 封面直连失败时，用第三方图片代理抓取并缩放；留空关闭 |
 | `video_proxy` | 空 | 视频下载代理模板，例如 `https://proxy.example/?url={url}` |
+| `video_proxy_first` | `false` | 直接使用第三方下载代理，跳过直连尝试 |
+| `video_proxy_api` | kukutool 接口 | 第三方视频下载代理接口，留空关闭 |
+| `download_chunk_kb` | `2048` | Range 分片下载大小，`0` 关闭分片 |
 | `send_cover` | `true` | 发送封面图 |
 | `send_video` | `false` | 下载并发送视频 |
 | `max_video_mb` | `30` | 视频大小上限，`0` 不限 |
@@ -199,7 +202,7 @@ https://your-parse-api.example.com/bili?url={url}
 第三方解析接口（星之阁等）返回的是 **B 站 CDN 上的签名 URL**，它们并不托管图片和视频。所以：
 
 - **封面**：插件支持 `cover_proxy`，默认用公开图片代理 `images.weserv.nl`：由代理服务器抓取 B 站封面并缩到 640px 再返回（约 13KB），小于常见的截断阈值，能完整拿到；
-- **视频**：没有公开的「视频托管/代理」服务，`video_proxy` 留给你填自己的代理模板；如果不配置，视频仍需要从 B 站 CDN 直接下载，服务器网络受限时无法绕过。
+- **视频**：插件内置了第三方下载代理接口（`video_proxy_api`，默认 kukutool 的公开接口），直连失败时会用它代下；也可以填自己的代理模板或 HTTP 代理。开启 `video_proxy_first` 可以跳过直连尝试，直接走第三方代理。
 
 插件绝不会把截断的图片或十几 KB 的初始化分片当成成品发送。
 

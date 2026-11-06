@@ -67,6 +67,12 @@
     "default": "https://images.weserv.nl/?url={host_path}&w=640&output=jpg",
     "hint": "直连 B 站图片被截断时，用第三方图片代理抓取并缩放。支持 {url} / {raw_url} / {host_path} 占位符；留空则关闭。"
   },
+  "video_proxy_first": {
+    "description": "直接使用第三方下载代理",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后跳过直连 CDN、镜像、durl 等尝试，直接把视频地址交给 video_proxy_api 代理下载；代理失败会自动回退直连。"
+  },
   "video_proxy_api": {
     "description": "第三方视频下载代理接口",
     "type": "string",

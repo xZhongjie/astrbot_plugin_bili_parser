@@ -1408,6 +1408,33 @@ class BiliParserPlugin(Star):
         tried_durl = False
         tried_providers = False
         tried_proxy_api = False
+
+        # 开关：直接跳过直连尝试，优先交给第三方下载代理
+        proxy_api = str(self.config.get("video_proxy_api") or "").strip()
+        if bool(self.config.get("video_proxy_first")) and proxy_api:
+            tried_proxy_api = True
+            proxied = await self._proxy_media_url(proxy_api, video.video_url, target)
+            if proxied:
+                logger.info("[bili] 跳过直连，优先使用第三方下载代理：%s", proxied[:100])
+                data = await self._fetch_media(proxied, headers, max_bytes)
+                if (
+                    data
+                    and len(data) >= 64 * 1024
+                    and self._looks_like_mp4(data)
+                ):
+                    path = self._data_dir / (
+                        f"bili_{int(time.time())}_{random.randint(1000, 9999)}.mp4"
+                    )
+                    await asyncio.to_thread(path.write_bytes, data)
+                    logger.info(
+                        "[bili] 视频已下载：%.1fMB（第三方代理）",
+                        len(data) / 1024 / 1024,
+                    )
+                    return str(path)
+                logger.warning("[bili] 第三方代理下载失败，回退直连尝试")
+            else:
+                logger.warning("[bili] 第三方代理未返回地址，回退直连尝试")
+
         while True:
             for candidate in candidates:
                 data = await self._fetch_media(candidate, headers, max_bytes)

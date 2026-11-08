@@ -640,6 +640,7 @@ class BiliParserPlugin(Star):
         self._buvid3 = ""
         self._recent: dict[str, float] = {}
         self._proxy_endpoint_cache: tuple[str, float] | None = None
+        self._video_tasks: set[asyncio.Task] = set()
         self._data_dir: Path | None = None
         self._initialized = False
 
@@ -1700,9 +1701,8 @@ class BiliParserPlugin(Star):
         body = "\n".join(f"{label}：{url}" for label, url in links)
         await self._send_plain(event, f"视频直链：\n{body}")
 
-    async def build_chain(
-        self, video: BiliVideo, target: BiliTarget, *, allow_video: bool = True
-    ) -> tuple[list[Any], str | None]:
+    async def build_chain(self, video: BiliVideo, target: BiliTarget) -> list[Any]:
+        """只构建卡片（封面 + 文本）。视频由后台任务单独下载发送。"""
         chain: list[Any] = []
         if bool(self.config.get("send_cover", True)):
             cover = await self._cover_component(video)
@@ -1712,16 +1712,40 @@ class BiliParserPlugin(Star):
         text = self.render_card(video, target)
         if text:
             chain.append(Comp.Plain(text))
+        return chain
 
-        # 只输出解析直链模式：直链由调用方单独发送，不混在卡片里
-        temp_path: str | None = None
-        if allow_video:
+    async def _deliver_video(
+        self, event: AstrMessageEvent, video: BiliVideo, target: BiliTarget
+    ) -> None:
+        """后台下载并单独发送视频，不阻塞卡片。"""
+        try:
             temp_path = await self._download_video(video, target)
-            if temp_path:
-                # 不能在这里立刻删除：AstrBot 的 respond 阶段是在插件处理器
-                # 结束后才真正发送，提前删文件会导致协议端 ENOENT。
-                self._schedule_cleanup(temp_path, delay=600)
-        return chain, temp_path
+        except Exception as exc:
+            logger.warning("[bili] 视频下载异常：%s", self._brief(exc))
+            return
+        if not temp_path:
+            logger.warning("[bili] 视频下载失败，跳过发送")
+            if self.config.get("show_error"):
+                await self._send_plain(
+                    event,
+                    "视频下载失败：B 站 CDN 返回的不是有效视频（可能被拦截），"
+                    "卡片已发送，详见插件日志。",
+                )
+            return
+        try:
+            await self._send_video(event, temp_path, video, target)
+        except Exception as exc:
+            logger.warning("[bili] 视频发送异常：%s", self._brief(exc))
+        finally:
+            self._schedule_cleanup(temp_path, delay=600)
+
+    def _schedule_video(
+        self, event: AstrMessageEvent, video: BiliVideo, target: BiliTarget
+    ) -> None:
+        """把视频下载/发送丢到后台，立即返回。"""
+        task = asyncio.create_task(self._deliver_video(event, video, target))
+        self._video_tasks.add(task)
+        task.add_done_callback(self._video_tasks.discard)
 
     # -- 发送 ---------------------------------------------------------------
     async def _send_chain(self, event: AstrMessageEvent, chain: list[Any]) -> bool:
@@ -1951,26 +1975,16 @@ class BiliParserPlugin(Star):
                 logger.exception("[bili] 解析异常")
                 continue
             attach_links = bool(self.config.get("attach_video_links"))
-            chain, temp = await self.build_chain(
-                video,
-                target,
-                allow_video=bool(self.config.get("send_video")) and not attach_links,
-            )
+            chain = await self.build_chain(video, target)
             if not await self._send_chain(event, chain):
                 # 图片发送失败时降级为纯文本卡片，至少把信息发出去
                 await self._send_plain(event, self.render_card(video, target))
-            if temp:
-                # QQ 要求 video 段单独成条，不能和卡片混发
-                await self._send_video(event, temp, video, target)
-            elif self.config.get("send_video") and not attach_links:
-                await self._send_plain(
-                    event,
-                    "视频下载失败：B 站 CDN 返回的不是有效视频（可能被拦截），"
-                    "卡片信息已发送，详见插件日志。",
-                )
             if attach_links:
                 # 直链单独发一条，不和卡片混在一起
                 await self._send_video_links(event, video, target)
+            elif bool(self.config.get("send_video")):
+                # 卡片已发出，视频后台下载后单独发送
+                self._schedule_video(event, video, target)
 
     @filter.command("bili", alias={"b站解析", "哔哩哔哩解析"})
     async def bili(self, event: AstrMessageEvent, args: GreedyStr):
@@ -2000,23 +2014,14 @@ class BiliParserPlugin(Star):
                 await self._send_plain(event, f"B站解析失败：{self._brief(exc)}")
                 continue
             attach_links = bool(self.config.get("attach_video_links"))
-            chain, temp = await self.build_chain(
-                video,
-                target,
-                allow_video=bool(self.config.get("send_video")) and not attach_links,
-            )
+            chain = await self.build_chain(video, target)
             if not await self._send_chain(event, chain):
                 await self._send_plain(event, self.render_card(video, target))
-            if temp:
-                await self._send_video(event, temp, video, target)
-            elif self.config.get("send_video") and not attach_links:
-                await self._send_plain(
-                    event,
-                    "视频下载失败：B 站 CDN 返回的不是有效视频（可能被拦截），"
-                    "卡片信息已发送，详见插件日志。",
-                )
             if attach_links:
                 await self._send_video_links(event, video, target)
+            elif bool(self.config.get("send_video")):
+                # 卡片已发出，视频后台下载后单独发送
+                self._schedule_video(event, video, target)
 
     @filter.command("bili_status")
     async def bili_status(self, event: AstrMessageEvent):

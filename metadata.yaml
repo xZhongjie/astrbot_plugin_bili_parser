@@ -2,7 +2,7 @@ name: astrbot_plugin_bili_parser
 display_name: B站视频解析
 desc: 自动识别 B 站视频链接并发送图文卡片。支持多第三方解析接口并行竞速、B站官方 API（自动生成 buvid3、412 自动换 Cookie 重试）、b23.tv 短链、分 P、封面下载与可选视频下载（CDN 镜像 host 轮换）。
 short_desc: B站链接解析，多接口防 412
-version: v1.3.2
+version: v1.3.3
 author: xZhongjie
 repo: https://github.com/xZhongjie/astrbot_plugin_bili_parser
 astrbot_version: ">=4.10.4"

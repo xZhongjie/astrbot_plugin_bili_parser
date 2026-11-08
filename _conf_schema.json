@@ -137,6 +137,13 @@
     "slider": {"min": 0, "max": 8192, "step": 256},
     "hint": "用 HTTP Range 分片下载视频，绕过单次连接被截断的问题；0 表示关闭，改用整包下载。"
   },
+  "download_concurrency": {
+    "description": "并行下载连接数",
+    "type": "int",
+    "default": 4,
+    "slider": {"min": 1, "max": 8, "step": 1},
+    "hint": "代理/单连接被限速时，多连接并行分片能明显提速；网络差时调到 2-3。"
+  },
   "video_proxy": {
     "description": "视频下载代理模板",
     "type": "string",

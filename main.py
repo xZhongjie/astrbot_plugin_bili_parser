@@ -526,6 +526,7 @@ class HttpClient:
         max_bytes: int = 0,
         timeout: float = 180,
         label: str = "",
+        concurrency: int = 1,
     ) -> bytes | None:
         """分片下载，绕过单次连接被截断的问题。
 
@@ -556,6 +557,58 @@ class HttpClient:
         offset = len(first)
         started = time.monotonic()
         last_logged = 0.0
+        concurrency = max(1, min(8, int(concurrency)))
+
+        if total and concurrency > 1:
+            # 多连接并行拉取，绕过单连接限速
+            ranges = [
+                (start, min(start + chunk_size - 1, total - 1))
+                for start in range(offset, total, chunk_size)
+            ]
+            sem = asyncio.Semaphore(concurrency)
+            lock = asyncio.Lock()
+
+            async def fetch(start: int, end: int) -> int:
+                nonlocal last_logged
+                async with sem:
+                    status, part, _ = await self.request_full(
+                        url,
+                        headers={**request_headers, "Range": f"bytes={start}-{end}"},
+                        timeout=timeout,
+                    )
+                if status not in (200, 206) or not part:
+                    return 0
+                async with lock:
+                    data[start:start + len(part)] = part
+                    percent = (start + len(part)) / total * 100
+                    if label and total >= 1024 * 1024 and (
+                        percent - last_logged >= 10 or percent >= 99.9
+                    ):
+                        last_logged = percent
+                        elapsed = max(0.001, time.monotonic() - started)
+                        speed = (percent / 100 * total) / elapsed / 1024 / 1024
+                        logger.info(
+                            "[bili] %s下载进度：%.0f%%（%.1f/%.1fMB，%.1fMB/s）",
+                            label,
+                            percent,
+                            percent / 100 * total / 1024 / 1024,
+                            total / 1024 / 1024,
+                            speed,
+                        )
+                return len(part)
+
+            results = await asyncio.gather(
+                *(fetch(start, end) for start, end in ranges)
+            )
+            if len(first) + sum(results) < total:
+                logger.warning(
+                    "[bili] 并行分片下载不完整：期望 %d，实际 %d",
+                    total,
+                    len(first) + sum(results),
+                )
+                return None
+            return bytes(data)
+
         while total and offset < total:
             if max_bytes and offset >= max_bytes:
                 return None
@@ -1369,6 +1422,7 @@ class BiliParserPlugin(Star):
                 chunk_size=chunk_kb * 1024,
                 max_bytes=max_bytes,
                 label="视频",
+                concurrency=int(self.config.get("download_concurrency") or 1),
             )
             if data:
                 return data

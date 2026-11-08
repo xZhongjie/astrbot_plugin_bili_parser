@@ -525,6 +525,7 @@ class HttpClient:
         chunk_size: int = 2 * 1024 * 1024,
         max_bytes: int = 0,
         timeout: float = 180,
+        label: str = "",
     ) -> bytes | None:
         """分片下载，绕过单次连接被截断的问题。
 
@@ -572,12 +573,13 @@ class HttpClient:
                 break
 
             percent = offset / total * 100 if total else 0
-            if percent - last_logged >= 10 or offset >= total:
+            if label and total >= 1024 * 1024 and (percent - last_logged >= 10 or offset >= total):
                 last_logged = percent
                 elapsed = max(0.001, time.monotonic() - started)
                 speed = offset / elapsed / 1024 / 1024
                 logger.info(
-                    "[bili] 下载进度：%.0f%%（%.1f/%.1fMB，%.1fMB/s）",
+                    "[bili] %s下载进度：%.0f%%（%.1f/%.1fMB，%.1fMB/s）",
+                    label,
                     percent,
                     offset / 1024 / 1024,
                     total / 1024 / 1024,
@@ -1366,6 +1368,7 @@ class BiliParserPlugin(Star):
                 headers=headers,
                 chunk_size=chunk_kb * 1024,
                 max_bytes=max_bytes,
+                label="视频",
             )
             if data:
                 return data

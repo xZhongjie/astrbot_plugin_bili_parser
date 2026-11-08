@@ -70,7 +70,7 @@
   "video_proxy_first": {
     "description": "直接使用第三方下载代理",
     "type": "bool",
-    "default": false,
+    "default": true,
     "hint": "开启后跳过直连 CDN、镜像、durl 等尝试，直接把视频地址交给 video_proxy_api 代理下载；代理失败会自动回退直连。"
   },
   "link_output": {
@@ -313,3 +313,4 @@
     }
   }
 }
+

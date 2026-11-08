@@ -1648,7 +1648,11 @@ class BiliParserPlugin(Star):
 
         while True:
             for candidate in candidates:
-                data = await self._fetch_media(candidate, headers, max_bytes)
+                try:
+                    data = await self._fetch_media(candidate, headers, max_bytes)
+                except Exception as exc:
+                    logger.info("[bili] 候选地址下载异常，跳过：%s", self._brief(exc))
+                    continue
                 if not data:
                     continue
                 # 关键校验：CDN 有时会返回 200 + 错误页、JSON，或者只返回
@@ -2165,6 +2169,7 @@ class BiliParserPlugin(Star):
             "支持：bilibili.com/video/BV...、av...、b23.tv 短链、?p= 分P、单独 BV 号。\n"
             "解析接口可在 WebUI 插件配置里增删，支持并行竞速与顺序回退。"
         )
+
 
 
 

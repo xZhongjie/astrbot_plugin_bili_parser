@@ -1432,7 +1432,7 @@ class BiliParserPlugin(Star):
                 chunk_size=chunk_kb * 1024,
                 max_bytes=max_bytes,
                 label="视频",
-                concurrency=int(self.config.get("download_concurrency") or 1),
+                concurrency=1,
             )
             if data:
                 return data
@@ -1642,9 +1642,9 @@ class BiliParserPlugin(Star):
                         time.monotonic() - download_started,
                     )
                     return str(path)
-                logger.warning("[bili] 第三方代理下载失败，回退直连尝试")
+                logger.warning("[bili] 第三方代理下载失败"); return None
             else:
-                logger.warning("[bili] 第三方代理未返回地址，回退直连尝试")
+                logger.warning("[bili] 第三方代理未返回地址"); return None
 
         while True:
             for candidate in candidates:
@@ -2169,6 +2169,7 @@ class BiliParserPlugin(Star):
             "支持：bilibili.com/video/BV...、av...、b23.tv 短链、?p= 分P、单独 BV 号。\n"
             "解析接口可在 WebUI 插件配置里增删，支持并行竞速与顺序回退。"
         )
+
 
 
 

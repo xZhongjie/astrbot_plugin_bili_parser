@@ -553,6 +553,8 @@ class HttpClient:
 
         data = bytearray(first)
         offset = len(first)
+        started = time.monotonic()
+        last_logged = 0.0
         while total and offset < total:
             if max_bytes and offset >= max_bytes:
                 return None
@@ -568,6 +570,19 @@ class HttpClient:
             offset += len(part)
             if len(part) == 0:
                 break
+
+            percent = offset / total * 100 if total else 0
+            if percent - last_logged >= 10 or offset >= total:
+                last_logged = percent
+                elapsed = max(0.001, time.monotonic() - started)
+                speed = offset / elapsed / 1024 / 1024
+                logger.info(
+                    "[bili] 下载进度：%.0f%%（%.1f/%.1fMB，%.1fMB/s）",
+                    percent,
+                    offset / 1024 / 1024,
+                    total / 1024 / 1024,
+                    speed,
+                )
 
         if total and len(data) < total:
             logger.warning(
@@ -1071,9 +1086,18 @@ class BiliParserPlugin(Star):
         for candidate_url, headers in self._cover_candidates(video.cover):
             if not candidate_url:
                 continue
-            data = await self.http.get_bytes(
-                candidate_url, headers=headers, timeout=20
+            # 分片下载，避免单连接在 15-32KB 处被截断
+            data = await self.http.download_range(
+                candidate_url,
+                headers=headers,
+                chunk_size=256 * 1024,
+                max_bytes=8 * 1024 * 1024,
+                timeout=30,
             )
+            if not data:
+                data = await self.http.get_bytes(
+                    candidate_url, headers=headers, timeout=20
+                )
             if not data:
                 continue
             # 连接被提前关闭时可能只拿到半张图，PIL 会容忍截断的 JPEG 并把
@@ -1526,6 +1550,8 @@ class BiliParserPlugin(Star):
         tried_durl = False
         tried_providers = True  # 第三方直链已经在候选里了
         tried_proxy_api = False
+        download_started = time.monotonic()
+        logger.info("[bili] 开始下载视频（%d 个候选地址）", len(candidates))
 
         # 开关：直接跳过直连尝试，优先交给第三方下载代理
         if bool(self.config.get("video_proxy_first")) and self._proxy_endpoints():
@@ -1544,8 +1570,9 @@ class BiliParserPlugin(Star):
                     )
                     await asyncio.to_thread(path.write_bytes, data)
                     logger.info(
-                        "[bili] 视频已下载：%.1fMB（第三方代理）",
+                        "[bili] 视频已下载：%.1fMB（第三方代理，用时 %.1fs）",
                         len(data) / 1024 / 1024,
+                        time.monotonic() - download_started,
                     )
                     return str(path)
                 logger.warning("[bili] 第三方代理下载失败，回退直连尝试")
@@ -1580,7 +1607,11 @@ class BiliParserPlugin(Star):
                     f"bili_{int(time.time())}_{random.randint(1000, 9999)}.mp4"
                 )
                 await asyncio.to_thread(path.write_bytes, data)
-                logger.info("[bili] 视频已下载：%.1fMB", len(data) / 1024 / 1024)
+                logger.info(
+                    "[bili] 视频已下载：%.1fMB（用时 %.1fs）",
+                    len(data) / 1024 / 1024,
+                    time.monotonic() - download_started,
+                )
                 return str(path)
 
             if not tried_durl:

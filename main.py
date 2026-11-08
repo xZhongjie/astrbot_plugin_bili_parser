@@ -553,58 +553,68 @@ class HttpClient:
             except ValueError:
                 total = 0
 
-        data = bytearray(first)
+        data = bytearray(total)
+        data[: len(first)] = first
         offset = len(first)
         started = time.monotonic()
         last_logged = 0.0
         concurrency = max(1, min(8, int(concurrency)))
 
         if total and concurrency > 1:
-            # 多连接并行拉取，绕过单连接限速
+            # 多连接并行拉取；每片必须完整，否则直接判失败
             ranges = [
                 (start, min(start + chunk_size - 1, total - 1))
                 for start in range(offset, total, chunk_size)
             ]
             sem = asyncio.Semaphore(concurrency)
             lock = asyncio.Lock()
+            completed = [len(first)]
+            failed = [False]
 
             async def fetch(start: int, end: int) -> int:
                 nonlocal last_logged
-                async with sem:
-                    status, part, _ = await self.request_full(
-                        url,
-                        headers={**request_headers, "Range": f"bytes={start}-{end}"},
-                        timeout=timeout,
-                    )
-                if status not in (200, 206) or not part:
+                want = end - start + 1
+                part = b""
+                for _ in range(3):
+                    async with sem:
+                        status, chunk, _ = await self.request_full(
+                            url,
+                            headers={**request_headers, "Range": f"bytes={start}-{end}"},
+                            timeout=timeout,
+                        )
+                    if status in (200, 206) and chunk:
+                        part = chunk
+                        if len(part) >= want:
+                            break
+                if len(part) < want:
+                    failed[0] = True
                     return 0
                 async with lock:
-                    data[start:start + len(part)] = part
-                    percent = (start + len(part)) / total * 100
+                    data[start:start + want] = part[:want]
+                    completed[0] += want
+                    percent = completed[0] / total * 100
                     if label and total >= 1024 * 1024 and (
                         percent - last_logged >= 10 or percent >= 99.9
                     ):
                         last_logged = percent
                         elapsed = max(0.001, time.monotonic() - started)
-                        speed = (percent / 100 * total) / elapsed / 1024 / 1024
+                        speed = completed[0] / elapsed / 1024 / 1024
                         logger.info(
                             "[bili] %s下载进度：%.0f%%（%.1f/%.1fMB，%.1fMB/s）",
                             label,
                             percent,
-                            percent / 100 * total / 1024 / 1024,
+                            completed[0] / 1024 / 1024,
                             total / 1024 / 1024,
                             speed,
                         )
-                return len(part)
+                return want
 
-            results = await asyncio.gather(
-                *(fetch(start, end) for start, end in ranges)
-            )
-            if len(first) + sum(results) < total:
+            await asyncio.gather(*(fetch(s, e) for s, e in ranges))
+            if failed[0] or len(first) + sum([]) + completed[0] - len(first) < total:
                 logger.warning(
                     "[bili] 并行分片下载不完整：期望 %d，实际 %d",
                     total,
-                    len(first) + sum(results),
+                    completed[0],
                 )
                 return None
             return bytes(data)
@@ -1673,7 +1683,11 @@ class BiliParserPlugin(Star):
 
             if not tried_durl:
                 tried_durl = True
-                durl_urls = await self._playurl_durl_urls(video)
+                try:
+                    durl_urls = await self._playurl_durl_urls(video)
+                except Exception as exc:
+                    logger.info("[bili] durl 获取失败：%s", self._brief(exc))
+                    durl_urls = []
                 if durl_urls:
                     candidates = []
                     for item in durl_urls:

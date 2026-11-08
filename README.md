@@ -235,6 +235,18 @@ https://your-parse-api.example.com/bili?url={url}
 
 插件绝不会把截断的图片或十几 KB 的初始化分片当成成品发送。
 
+### 视频下载顺序（v1.2.0 重写）
+
+参考 `koishi-shangxue-apps` 的做法，现在的下载顺序是：
+
+1. **第三方解析接口返回的 `data.video.url`**（星之阁等）——直接带 Referer 分片下载，不再先用官方 playurl 替换
+2. 官方 playurl 的 `durl` MP4（第三方直链都失败时）
+3. 其他第三方解析接口的直链
+4. 第三方下载代理（kukutool / maxhelper）
+5. 仍失败则输出提示，不会发半截视频
+
+这样第三方接口能直连时，完全不依赖 B 站官方 playurl，也避开了官方签名绑定服务器 IP 的问题。
+
 ### 视频代理方案
 
 公开的「视频代理」基本不存在：通用 CORS 代理（allorigins、codetabs 等）通常限制 5MB 左右、不保证 Range 和视频流，20MB 的视频拉不下来。插件内置了两种可用方案：

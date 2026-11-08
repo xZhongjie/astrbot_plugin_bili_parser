@@ -1483,17 +1483,26 @@ class BiliParserPlugin(Star):
         if self.http is None or self._data_dir is None:
             return None
 
-        # 第三方接口给的直链通常把签名绑定在第三方服务器 IP 上，从我们这边
-        # 下载往往只能拿到初始化分片。所以只要知道 bvid / aid，就优先用
-        # 自己请求 playurl 得到的、签名绑定本机 IP 的直链。
-        provider_url = video.video_url
-        if (video.bvid or video.aid) and not qn_override:
-            video = replace(video, video_url="")
-            await self._fill_play_url(video, force=True)
-            if not video.video_url and provider_url:
-                video = replace(video, video_url=provider_url)
-        else:
+        # 第三方解析接口（星之阁等）返回的 video.url 就是可直接下载的直链。
+        # 优先下载它；只有第三方直链都失败时才回退到官方 playurl。
+        provider_urls: list[str] = []
+        if video.video_url:
+            provider_urls.append(video.video_url)
+        if not provider_urls and target is not None:
+            try:
+                provider_urls = await self._provider_video_urls(target)
+            except Exception as exc:
+                logger.info("[bili] 第三方接口获取视频直链失败：%s", self._brief(exc))
+        if qn_override:
             await self._fill_play_url(video, qn_override)
+            if video.video_url and video.video_url not in provider_urls:
+                provider_urls.insert(0, video.video_url)
+        elif not provider_urls and (video.bvid or video.aid):
+            await self._fill_play_url(video)
+            if video.video_url:
+                provider_urls.append(video.video_url)
+        if provider_urls:
+            video = replace(video, video_url=provider_urls[0])
         if not video.video_url:
             logger.info("[bili] 没有可用的视频直链，跳过视频下载")
             return None
@@ -1505,11 +1514,16 @@ class BiliParserPlugin(Star):
         if video.bvid:
             headers["Referer"] = f"https://www.bilibili.com/video/{video.bvid}"
 
-        candidates = self._add_video_proxy(
-            list(self._candidate_video_urls(video.video_url))
-        )
+        candidates: list[str] = []
+        for url in provider_urls:
+            for item in self._candidate_video_urls(url):
+                if item not in candidates:
+                    candidates.append(item)
+        if not candidates:
+            candidates = list(self._candidate_video_urls(video.video_url))
+        candidates = self._add_video_proxy(candidates)
         tried_durl = False
-        tried_providers = False
+        tried_providers = True  # 第三方直链已经在候选里了
         tried_proxy_api = False
 
         # 开关：直接跳过直连尝试，优先交给第三方下载代理
